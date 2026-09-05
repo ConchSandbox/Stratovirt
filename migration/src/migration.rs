@@ -617,12 +617,8 @@ impl DirtyBitmap {
     fn new(gpa: u64, hva: u64, len: u64) -> Self {
         let page_size = host_page_size();
 
-        let mut num_pages = len / page_size;
-        // Page alignment.
-        if !len.is_multiple_of(page_size) {
-            num_pages += 1;
-        }
-        let size = num_pages / 64 + 1;
+        let num_pages = len.div_ceil(page_size);
+        let size = num_pages.div_ceil(64);
         let map: Vec<AtomicU64> = (0..size).map(|_| AtomicU64::new(0)).collect();
 
         DirtyBitmap {
@@ -651,7 +647,7 @@ impl DirtyBitmap {
         let last_bit = (offset + len - 1) / self.page_size;
         for n in first_bit..=last_bit {
             // Ignore bit that is out of range.
-            if n >= self.len {
+            if n >= self.len.div_ceil(self.page_size) {
                 break;
             }
             self.map[(n as usize) >> 6].fetch_or(1 << (n & 63), Ordering::SeqCst);
