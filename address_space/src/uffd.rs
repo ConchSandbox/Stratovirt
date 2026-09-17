@@ -45,7 +45,7 @@ const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1 << 0;
 
 // UFFD_FEATURE_EVENT_REMOVE: generate REMOVE events on madvise(MADV_DONTNEED)
 // so the external uffd daemon can track dirty pages during snapshot creation.
-const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 6;
+const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
 // UFFD_FEATURE_WP_ASYNC: write-protect faults are cleared by the kernel
 // automatically (no UFFD event), which is required for UFFDIO_COPY_MODE_WP.
 const UFFD_FEATURE_WP_ASYNC: u64 = 1 << 15;
