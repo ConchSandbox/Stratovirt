@@ -49,6 +49,9 @@ const DEVICE_PATH_SUFFIX: &str = "state";
 pub enum RestoreMode {
     /// Directly mmap the memory snapshot file as the RAM backend.
     Mapped,
+    /// Guest RAM is already mapped from configured file backends; the EXTERNAL
+    /// snapshot memory file contains only its layout and the ram list section.
+    MappedExternal,
     /// Read/copy memory from the snapshot file into pre-allocated RAM.
     Copy,
     /// Guest RAM pages are served on demand by the external uffd daemon
@@ -185,7 +188,10 @@ impl MigrationManager {
             RestoreMode::Mapped | RestoreMode::Copy
                 if snapshot_memory == SnapshotMemoryMode::External =>
             {
-                bail!("memory=external requires UFFD restore")
+                bail!("memory=external requires mapped file backends or UFFD restore")
+            }
+            RestoreMode::MappedExternal if snapshot_memory != SnapshotMemoryMode::External => {
+                bail!("External mapped restore requires an EXTERNAL memory snapshot")
             }
             RestoreMode::Uffd { memory, .. } if memory != snapshot_memory => {
                 bail!("Incoming memory mode does not match snapshot memory file")

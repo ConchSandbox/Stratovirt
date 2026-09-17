@@ -159,12 +159,10 @@ impl IncomingConfig {
     fn check_incoming_valid(&self) -> Result<()> {
         self.check_common_valid()?;
 
-        if self.memory == SnapshotMemoryMode::External && self.mapped {
-            bail!("memory=external requires mapped=false");
-        }
-
-        if self.memory == SnapshotMemoryMode::External && self.uffd_sock.is_none() {
-            bail!("memory=external requires uffd_sock");
+        // Mapped external RAM backends are checked during memory initialization,
+        // after the memory objects have been bound to their NUMA nodes.
+        if self.memory == SnapshotMemoryMode::External && !self.mapped && self.uffd_sock.is_none() {
+            bail!("memory=external requires mapped=true or uffd_sock");
         }
 
         Ok(())
@@ -321,6 +319,15 @@ mod tests {
         let bad_tracking =
             "file:/tmp/snap,mapped=false,uffd_sock=/run/uffd.sock,uffd-track-dirty=true";
         assert!(parse_incoming_uri(bad_tracking).is_err());
+
+        let raw_ram = "file:/tmp/snap,memory=external";
+        let cfg = parse_incoming_uri(raw_ram).unwrap();
+        assert_eq!(cfg.memory, SnapshotMemoryMode::External);
+        assert!(cfg.mapped);
+        assert!(parse_incoming_uri(&format!("{raw_ram},mapped=false")).is_err());
+        assert!(parse_incoming_uri(&format!("{raw_ram},uffd_sock=/run/uffd.sock")).is_err());
+        assert!(parse_incoming_uri("file:/tmp/snap,ram-file=/tmp/ram.img").is_err());
+        assert!(parse_incoming_uri(&format!("{raw_ram},ram-file=/tmp/ram.img")).is_err());
     }
 
     #[test]

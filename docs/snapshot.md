@@ -57,6 +57,50 @@ $ ./stratovirt \
 
 The device configuration must be the same with template VM. Its cpu number, guest memory size, device number and type can be changed. For drive file, only support previous file or its backups. After that, the VM is created from template successfully.
 
+## Restore with file memory backends
+
+Restore a `memory=external` snapshot using the existing memory backend options.
+For a VM without NUMA, provide its complete raw Guest RAM image with `-mem-path`:
+
+```text
+-mem-path /mnt/erofs/memory/ram.img
+-incoming file:/path/to/snapshot,memory=external,uffd-track-dirty=true
+```
+
+Keep `mem-share=off` (the default). For a NUMA VM, configure a separate file for
+each RAM backend and explicitly set `share=off`; file objects default to sharing:
+
+```text
+-m 2G -smp 2
+-object memory-backend-file,id=mem0,size=1G,mem-path=/mnt/erofs/memory/node0.img,share=off
+-object memory-backend-file,id=mem1,size=1G,mem-path=/mnt/erofs/memory/node1.img,share=off
+-numa node,nodeid=0,cpus=0,memdev=mem0
+-numa node,nodeid=1,cpus=1,memdev=mem1
+-incoming file:/path/to/snapshot,memory=external,uffd-track-dirty=true
+```
+
+The NUMA topology, backend IDs, sizes, and RAM layout must match the source VM.
+A memory object supplies Guest RAM only when bound through NUMA `memdev`.
+Each file begins at offset zero and must be a regular file whose logical size
+exactly matches its backend. To use a flat multi-region RAM export, split it into
+backend files according to the offsets and sizes from `query-mem-mappings`.
+
+External mapped restore opens existing files read-only and maps them privately
+with copy-on-write. Guest RAM remains writable; Guest writes do not change the
+files. Missing, empty, incorrectly sized, or shared backends are rejected.
+`mem-prealloc` and host NUMA policies retain their normal meaning; preallocation
+touches all pages and therefore forfeits lazy loading and initial COW sharing.
+
+The snapshot and RAM files must represent the same VM state and remain immutable
+during use. A file backing a private mapping does not automatically contain the
+VM's later writes; obtain a consistent RAM export before restoring it.
+
+This mode requires `memory=external` and `mapped=true` (the default), and cannot
+be combined with `uffd_sock`. Dirty tracking is optional. The native snapshot
+still supplies the RAM layout, RamList memory, and device state. Full snapshots
+continue to supply their embedded RAM; external UFFD restore continues to use
+`mapped=false,uffd_sock=...`.
+
 ## Incremental memory tracking
 
 Enable the existing UFFD WP_ASYNC dirty tracker without an external page-fault
@@ -113,7 +157,8 @@ Some devices and feature don't support to be snapshot yet:
 - `vhost-net`
 - `vfio` devices
 - `balloon`
-- `hugepage`,`mem-shared`,`backend file of memory`
+- `hugepage`, `mem-shared` (private regular-file backends are supported for
+  external mapped restore as described above)
 - `pmu`
 - `sve`
 - `gic-version=2`

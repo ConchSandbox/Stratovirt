@@ -13,6 +13,7 @@
 use std::cmp::min;
 use std::ffi::CString;
 use std::fs::{remove_file, File};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 use std::thread;
@@ -33,6 +34,13 @@ const MPOL_MF_STRICT: u32 = 1;
 /// Move pages owned by this process to conform to mapping.
 const MPOL_MF_MOVE: u32 = 2;
 
+/// Whether to allocate RAM or adopt an immutable external snapshot backend.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBackendMode {
+    Allocate,
+    Snapshot,
+}
+
 /// FileBackend represents backend-file of `HostMemMapping`.
 #[derive(Clone, Debug)]
 pub struct FileBackend {
@@ -51,6 +59,28 @@ fn file_unlink(file_path: &str) {
 }
 
 impl FileBackend {
+    /// Open a complete raw RAM snapshot without creating or resizing it.
+    fn new_snapshot(file_path: &str, file_len: u64) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            // A FIFO must fail the regular-file check rather than block open().
+            .custom_flags(libc::O_NONBLOCK)
+            .open(file_path)
+            .with_context(|| format!("Failed to open RAM snapshot backend {file_path}"))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || file_len == 0 || metadata.len() != file_len {
+            bail!(
+                "RAM snapshot backend {file_path} must be a regular file of exactly {file_len} bytes (got {})",
+                metadata.len()
+            );
+        }
+        Ok(Self {
+            file: Arc::new(file),
+            offset: 0,
+            page_size: host_page_size(),
+        })
+    }
+
     /// Construct a new FileBackend with an opened file.
     ///
     /// # Arguments
@@ -242,10 +272,23 @@ unsafe fn mem_prealloc(host_addr: u64, size: u64, nr_vcpus: u8) {
 ///
 /// * `mem_config` - The config of default memory.
 /// * `thread_num` - The num of mem preallocv threads, typically the number of vCPUs.
-pub fn create_default_mem(mem_config: &MachineMemConfig, thread_num: u8) -> Result<Region> {
+/// * `mode` - Allocate RAM or map an existing external snapshot privately.
+pub fn create_default_mem(
+    mem_config: &MachineMemConfig,
+    thread_num: u8,
+    mode: MemoryBackendMode,
+) -> Result<Region> {
     let mut f_back: Option<FileBackend> = None;
 
-    if let Some(path) = &mem_config.mem_path {
+    if mode == MemoryBackendMode::Snapshot {
+        if mem_config.mem_share {
+            bail!("External mapped restore requires mem-share=off");
+        }
+        let path = mem_config.mem_path.as_ref().context(
+            "External mapped restore requires -mem-path for default RAM; memory backend objects must be bound through NUMA memdev",
+        )?;
+        f_back = Some(FileBackend::new_snapshot(path, mem_config.mem_size)?);
+    } else if let Some(path) = &mem_config.mem_path {
         f_back = Some(
             FileBackend::new_mem(path, mem_config.mem_size)
                 .with_context(|| "Failed to create file that backs memory")?,
@@ -296,10 +339,27 @@ pub fn create_default_mem(mem_config: &MachineMemConfig, thread_num: u8) -> Resu
 ///
 /// * `mem_config` - The config of default memory.
 /// * `thread_num` - The num of mem preallocv threads, typically the number of vCPUs.
-pub fn create_backend_mem(mem_config: &MemBackendObjConfig, thread_num: u8) -> Result<Region> {
+/// * `mode` - Allocate RAM or map an existing external snapshot privately.
+pub fn create_backend_mem(
+    mem_config: &MemBackendObjConfig,
+    thread_num: u8,
+    mode: MemoryBackendMode,
+) -> Result<Region> {
     let mut f_back: Option<FileBackend> = None;
 
-    if mem_config.memfd() {
+    if mode == MemoryBackendMode::Snapshot {
+        if mem_config.mem_type != "memory-backend-file" || mem_config.share() {
+            bail!(
+                "External mapped restore requires memory-backend-file with share=off for RAM backend {}",
+                mem_config.id
+            );
+        }
+        let path = mem_config
+            .mem_path
+            .as_ref()
+            .context("External mapped restore requires a RAM backend mem-path")?;
+        f_back = Some(FileBackend::new_snapshot(path, mem_config.size)?);
+    } else if mem_config.memfd() {
         let anon_fd = memfd_create(
             &CString::new("stratovirt_anon_mem")?,
             MemFdCreateFlag::empty(),
@@ -503,7 +563,14 @@ impl Drop for HostMemMapping {
 #[cfg(test)]
 mod test {
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::AsRawFd;
 
+    use machine_manager::config::VmConfig;
+    use nix::fcntl::{fcntl, FcntlArg};
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -511,6 +578,65 @@ mod test {
     fn identify(ram: HostMemMapping, st: u64, end: u64) {
         assert_eq!(ram.start_address(), GuestAddress(st));
         assert_eq!(ram.size(), end - st);
+    }
+
+    #[test]
+    fn test_snapshot_backend_is_readonly_and_requires_exact_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("ram.img");
+        let path_str = path.to_str().unwrap();
+        assert!(FileBackend::new_snapshot(path_str, 0x1000).is_err());
+        assert!(!path.exists());
+        let file = File::create(&path).unwrap();
+        for size in [0, 0x800, 0x2000] {
+            file.set_len(size).unwrap();
+            assert!(FileBackend::new_snapshot(path_str, 0x1000).is_err());
+            assert_eq!(file.metadata().unwrap().len(), size);
+        }
+        file.set_len(0x1000).unwrap();
+        let backend = FileBackend::new_snapshot(path_str, 0x1000).unwrap();
+        assert_eq!(
+            fcntl(backend.file.as_raw_fd(), FcntlArg::F_GETFL).unwrap() & libc::O_ACCMODE,
+            libc::O_RDONLY
+        );
+        assert!(backend.file.write_all_at(&[1], 0).is_err());
+        assert!(FileBackend::new_snapshot(dir.as_path().to_str().unwrap(), 0x1000).is_err());
+        let fifo = dir.as_path().join("fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        assert!(FileBackend::new_snapshot(fifo.to_str().unwrap(), 0x1000).is_err());
+    }
+
+    #[test]
+    fn test_external_restore_requires_private_file_backends() {
+        let raw = TempFile::new().unwrap();
+        raw.as_file().set_len(0x1000).unwrap();
+        let mut default_config = MachineMemConfig {
+            mem_size: 0x1000,
+            ..Default::default()
+        };
+        assert!(create_default_mem(&default_config, 1, MemoryBackendMode::Snapshot).is_err());
+        default_config.mem_path = Some(raw.as_path().to_str().unwrap().to_string());
+        default_config.mem_share = true;
+        assert!(create_default_mem(&default_config, 1, MemoryBackendMode::Snapshot).is_err());
+        default_config.mem_share = false;
+        assert!(create_default_mem(&default_config, 1, MemoryBackendMode::Snapshot).is_ok());
+
+        let mut vm_config = VmConfig::default();
+        let mut backend = vm_config
+            .add_mem_backend(&format!(
+                "memory-backend-file,size=4K,id=ram,mem-path={}",
+                raw.as_path().display()
+            ))
+            .unwrap();
+        // File objects default to share=on; restoring an immutable file must reject that.
+        assert!(create_backend_mem(&backend, 1, MemoryBackendMode::Snapshot).is_err());
+        backend.share = Some(false);
+        assert!(create_backend_mem(&backend, 1, MemoryBackendMode::Snapshot).is_ok());
+        for mem_type in ["memory-backend-ram", "memory-backend-memfd"] {
+            backend.mem_type = mem_type.to_string();
+            backend.mem_path = None;
+            assert!(create_backend_mem(&backend, 1, MemoryBackendMode::Snapshot).is_err());
+        }
     }
 
     #[test]

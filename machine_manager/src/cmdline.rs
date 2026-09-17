@@ -326,7 +326,8 @@ pub fn create_args_parser<'a>() -> ArgParser<'a> {
             .value_name("<parameters>")
             .help("\n\t\tdo the migration using tcp socket: -incoming tcp:<ip>:<port>; \
                    \n\t\tdo the migration using unix socket: -incoming unix:<socket path>; \
-                   \n\t\trestore a snapshot: -incoming file:<directory>[,mapped=<true|false>][,uffd-track-dirty=<true|false>]")
+                   \n\t\trestore a snapshot: -incoming file:<directory>[,mapped=<true|false>][,uffd-track-dirty=<true|false>]; \
+                   \n\t\trestore with configured file memory backends: -incoming file:<directory>,memory=external[,uffd-track-dirty=true]")
             .takes_value(true),
         )
         .arg(

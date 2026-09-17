@@ -46,7 +46,8 @@ use vmm_sys_util::eventfd::EventFd;
 use address_space::FileBackend;
 use address_space::{
     create_backend_mem, create_default_mem, register_ram_list, AddressAttr, AddressSpace,
-    AliasRegionState, GuestAddress, RamRegionState, Region, RegionType, DEFAULT_RAM_REGION_NAME,
+    AliasRegionState, GuestAddress, MemoryBackendMode, RamRegionState, Region, RegionType,
+    DEFAULT_RAM_REGION_NAME,
 };
 #[cfg(target_arch = "aarch64")]
 use address_space::{register_ram_region, HostMemMapping};
@@ -132,7 +133,7 @@ use machine_manager::config::{
     complete_numa_node, get_pci_bdf, get_value_of_parameter, parse_numa_distance, parse_numa_mem,
     str_slip_to_clap, BootIndexInfo, BootSource, DriveConfig, DriveFile, IncomingConfig,
     MachineMemConfig, MigrateMode, NetworkInterfaceConfig, NumaNode, NumaNodes, PciBdf,
-    SerialConfig, VmConfig, FAST_UNPLUG_ON, MAX_VIRTIO_QUEUE,
+    SerialConfig, SnapshotMemoryMode, VmConfig, FAST_UNPLUG_ON, MAX_VIRTIO_QUEUE,
 };
 #[cfg(feature = "virtio_serial")]
 use machine_manager::config::{VirtioSerialInfo, VirtioSerialPortCfg};
@@ -780,12 +781,17 @@ pub trait MachineOps: MachineLifecycle {
         mem_config: &MachineMemConfig,
     ) -> Result<()>;
 
-    fn create_machine_ram(&self, mem_config: &MachineMemConfig, thread_num: u8) -> Result<()> {
+    fn create_machine_ram(
+        &self,
+        mem_config: &MachineMemConfig,
+        thread_num: u8,
+        mode: MemoryBackendMode,
+    ) -> Result<()> {
         let root = self.get_vm_ram();
         let numa_nodes = self.get_numa_nodes();
 
         if numa_nodes.is_none() || mem_config.membackend_objs.is_none() {
-            let default_mem = create_default_mem(mem_config, thread_num)?;
+            let default_mem = create_default_mem(mem_config, thread_num, mode)?;
             root.add_subregion_not_update(default_mem, 0_u64)?;
             return Ok(());
         }
@@ -794,7 +800,7 @@ pub trait MachineOps: MachineLifecycle {
         for node in numa_nodes.as_ref().unwrap().iter() {
             for mb_obj in mb_objs.iter() {
                 if mb_obj.id.eq(&node.1.mem_dev) {
-                    let ram = create_backend_mem(mb_obj, thread_num)?;
+                    let ram = create_backend_mem(mb_obj, thread_num, mode)?;
                     root.add_subregion_not_update(ram, offset)?;
                     offset = offset
                         .checked_add(mb_obj.size)
@@ -848,6 +854,7 @@ pub trait MachineOps: MachineLifecycle {
         &self,
         sys_mem: &Arc<AddressSpace>,
         mem_config: &MachineMemConfig,
+        nr_cpus: u8,
     ) -> Result<()> {
         let migrate_info = self.get_migrate_info();
         let mut snapshot_path = PathBuf::from(&migrate_info.uri);
@@ -860,13 +867,30 @@ pub trait MachineOps: MachineLifecycle {
             File::open(&snapshot_path).with_context(|| "Failed to open memory snapshot file")?;
         let memory_header = MigrationManager::restore_header(&mut memory_file)?;
         memory_header.check_header()?;
-        if memory_header.format != FileFormat::MemoryFull {
-            bail!("Invalid memory snapshot file");
+        let expected_format = match migrate_info.memory {
+            SnapshotMemoryMode::External => FileFormat::MemoryExternal,
+            SnapshotMemoryMode::Full => FileFormat::MemoryFull,
+        };
+        if memory_header.format != expected_format {
+            bail!(
+                "Memory snapshot format {:?} does not match {:?} restore",
+                memory_header.format,
+                expected_format
+            );
         }
-
-        sys_mem
-            .build_mapped_ram_from_snapshot(&mut memory_file)
-            .with_context(|| "Failed to restore mapped guest memory layout")?;
+        if migrate_info.memory == SnapshotMemoryMode::External {
+            self.create_machine_ram(mem_config, nr_cpus, MemoryBackendMode::Snapshot)?;
+            self.init_machine_ram(sys_mem, mem_config)?;
+            sys_mem
+                .validate_external_ram_from_snapshot(&mut memory_file)
+                .context(
+                    "External snapshot memory layout does not match configured RAM backends",
+                )?;
+        } else {
+            sys_mem
+                .build_mapped_ram_from_snapshot(&mut memory_file)
+                .with_context(|| "Failed to restore mapped guest memory layout")?;
+        }
         let expected_ram_states = self.expected_ram_region_states(mem_config)?;
         let expected_alias_states = self.expected_alias_region_states(mem_config);
         sys_mem
@@ -915,9 +939,9 @@ pub trait MachineOps: MachineLifecycle {
         trace::trace_scope_start!(init_memory);
         let migrate_info = self.get_migrate_info();
         if migrate_info.mode == MigrateMode::File && migrate_info.mapped {
-            self.restore_mapped_ram(sys_mem, mem_config)?;
+            self.restore_mapped_ram(sys_mem, mem_config, nr_cpus)?;
         } else {
-            self.create_machine_ram(mem_config, nr_cpus)?;
+            self.create_machine_ram(mem_config, nr_cpus, MemoryBackendMode::Allocate)?;
             self.init_machine_ram(sys_mem, mem_config)?;
         }
 
@@ -3501,6 +3525,8 @@ fn start_incoming_migration(
                     socket_path: uffd_sock.clone(),
                     memory: migrate_info.memory,
                 }
+            } else if migrate_info.memory == SnapshotMemoryMode::External && migrate_info.mapped {
+                RestoreMode::MappedExternal
             } else if migrate_info.mapped {
                 RestoreMode::Mapped
             } else {
@@ -3699,9 +3725,13 @@ pub fn type_init() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::FileExt;
     use std::sync::Arc;
 
     use address_space::{GuestAddress, HostMemMapping, Region};
+    use migration::MigrationHook;
+    use vmm_sys_util::tempdir::TempDir;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
 
@@ -3722,12 +3752,90 @@ mod tests {
         let mut machine = LightMachine::new(&vm_config).unwrap();
         machine.base.numa_nodes = machine.add_numa_nodes(&mut vm_config).unwrap();
         machine
-            .create_machine_ram(&vm_config.machine_config.mem_config, 1)
+            .create_machine_ram(
+                &vm_config.machine_config.mem_config,
+                1,
+                MemoryBackendMode::Allocate,
+            )
             .unwrap();
 
         let regions = machine.get_vm_ram().subregions();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].name, "main");
+    }
+
+    #[test]
+    fn test_external_mapped_restore_uses_numa_memdev_backends() {
+        const NODE_SIZE: u64 = 2 * 1024 * 1024;
+        let dir = TempDir::new().unwrap();
+        let mut config = VmConfig::default();
+        config.machine_config.hypervisor = HypervisorType::Test;
+        config.machine_config.mem_config.mem_size = NODE_SIZE * 2;
+        config.add_cpu("2").unwrap();
+        // Unbound objects can belong to devices and must not supply Guest RAM.
+        config
+            .add_mem_backend("memory-backend-ram,size=2M,id=unused")
+            .unwrap();
+        let mut files = Vec::new();
+        // Object order deliberately differs from NUMA node order.
+        for (node, value) in [(1, 84), (0, 42)] {
+            let raw = TempFile::new().unwrap();
+            raw.as_file().set_len(NODE_SIZE).unwrap();
+            raw.as_file().write_all_at(&[value], 0).unwrap();
+            config
+                .add_mem_backend(&format!(
+                    "memory-backend-file,size=2M,id=ram{node},mem-path={},share=off",
+                    raw.as_path().display()
+                ))
+                .unwrap();
+            config
+                .add_numa(&format!("node,nodeid={node},cpus={node},memdev=ram{node}"))
+                .unwrap();
+            files.push(raw);
+        }
+
+        let mut source_config = config.clone();
+        let mut source = LightMachine::new(&source_config).unwrap();
+        source.base.numa_nodes = source.add_numa_nodes(&mut source_config).unwrap();
+        let mem_config = &source_config.machine_config.mem_config;
+        source
+            .create_machine_ram(mem_config, 2, MemoryBackendMode::Allocate)
+            .unwrap();
+        source
+            .init_machine_ram(&source.base.sys_mem, mem_config)
+            .unwrap();
+        let mut memory = File::create(dir.as_path().join(MEMORY_PATH_SUFFIX)).unwrap();
+        MigrationManager::save_header(Some(FileFormat::MemoryExternal), &mut memory).unwrap();
+        source
+            .base
+            .sys_mem
+            .save_memory(&mut memory, SnapshotMemoryMode::External)
+            .unwrap();
+        drop(memory);
+
+        config
+            .add_incoming(&format!("file:{},memory=external", dir.as_path().display()))
+            .unwrap();
+        let mut restored = LightMachine::new(&config).unwrap();
+        restored.base.numa_nodes = restored.add_numa_nodes(&mut config).unwrap();
+        restored
+            .restore_mapped_ram(&restored.base.sys_mem, &config.machine_config.mem_config, 2)
+            .unwrap();
+        let mut regions = restored.get_vm_ram().subregions();
+        regions.sort_by_key(|region| region.offset().raw_value());
+        assert_eq!(regions.len(), 2);
+        for (index, region) in regions.iter().enumerate() {
+            assert_eq!(region.name, format!("ram{index}"));
+            assert_eq!(region.offset().raw_value(), index as u64 * NODE_SIZE);
+            let mut value = Vec::new();
+            region.read(&mut value, GuestAddress(0), 0, 1).unwrap();
+            assert_eq!(value, [if index == 0 { 42 } else { 84 }]);
+        }
+        let mut value: &[u8] = &[99];
+        regions[1].write(&mut value, GuestAddress(0), 0, 1).unwrap();
+        let mut original = [0];
+        files[0].as_file().read_exact_at(&mut original, 0).unwrap();
+        assert_eq!(original, [84]);
     }
 
     #[test]

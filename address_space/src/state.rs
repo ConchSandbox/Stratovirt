@@ -10,6 +10,7 @@
 // NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 // See the Mulan PSL v2 for more details.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -47,7 +48,8 @@ pub struct RamRegionState {
     // Region name.
     pub name: String,
     // Offset has different meanings in different region.
-    // 1) Address space RAM region: representing the offset from the first address space RAM region.
+    // 1) Address space RAM region: offset in the serialized RAM payload (FULL)
+    //    or in machine RAM / the flat external export (EXTERNAL).
     // 2) Ramlist RAM region: representing the offset from the first ramlist ram region.
     pub offset: u64,
     // Region size.
@@ -253,14 +255,11 @@ fn read_address_space_state(memory: &mut File) -> Result<AddressSpaceState> {
 }
 
 impl AddressSpace {
+    /// Build RAM mappings from the payload in a full native snapshot.
     pub fn build_mapped_ram_from_snapshot(&self, memory: &mut File) -> Result<()> {
         let address_space_state = read_address_space_state(memory)?;
         let first_region_offset = memory.stream_position()?;
-        let cloned_file = match memory.try_clone() {
-            Ok(file) => file,
-            Err(e) => bail!("Failed to clone memory file: {:?}", e),
-        };
-        let memfile_arc = Arc::new(cloned_file);
+        let memfile_arc = Arc::new(memory.try_clone().context("Failed to clone memory file")?);
 
         let machine_ram = self
             .get_machine_ram()
@@ -284,6 +283,34 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Match RAM created from the configured backends against external metadata.
+    pub fn validate_external_ram_from_snapshot(&self, memory: &mut File) -> Result<()> {
+        self.validate_external_ram_layout(&read_address_space_state(memory)?)
+    }
+
+    fn validate_external_ram_layout(&self, state: &AddressSpaceState) -> Result<()> {
+        let mut names = HashSet::new();
+        let mut total_size = 0_u64;
+        for region in &state.ram_region_state {
+            if !names.insert(&region.name) {
+                bail!("Duplicate RAM region {} in external snapshot", region.name);
+            }
+            total_size = total_size
+                .checked_add(region.size)
+                .context("External snapshot RAM size overflow")?;
+        }
+        if total_size == 0 || total_size != state.total_region_size {
+            bail!("External snapshot total RAM size does not match its regions");
+        }
+        names.clear();
+        for alias in &state.alias_region_state {
+            if !names.insert(&alias.name) {
+                bail!("Duplicate RAM alias {} in external snapshot", alias.name);
+            }
+        }
+        self.validate_mapped_ram_from_snapshot(&state.ram_region_state, &state.alias_region_state)
+    }
+
     pub fn validate_mapped_ram_from_snapshot(
         &self,
         expected_ram_states: &[RamRegionState],
@@ -302,7 +329,11 @@ impl AddressSpace {
         Ok(())
     }
 
-    pub fn skip_mapped_ram_from_snapshot(&self, memory: &mut File) -> Result<()> {
+    pub fn skip_mapped_ram_from_snapshot(
+        &self,
+        memory: &mut File,
+        mode: SnapshotMemoryMode,
+    ) -> Result<()> {
         let address_space_state = read_address_space_state(memory)?;
         let first_region_offset = memory.stream_position()?;
         let machine_ram = self
@@ -312,6 +343,10 @@ impl AddressSpace {
             bail!("Mapped ram layout has not been initialized");
         }
 
+        if mode == SnapshotMemoryMode::External {
+            // There is no RAM payload in this file; the RamList header follows.
+            return self.validate_external_ram_layout(&address_space_state);
+        }
         let region_data_end = first_region_offset
             .checked_add(address_space_state.total_region_size)
             .with_context(|| {
@@ -426,17 +461,27 @@ impl AddressSpace {
     }
 }
 
-impl StateTransfer for AddressSpace {
-    fn get_state_vec(&self) -> Result<Vec<u8>> {
+impl AddressSpace {
+    fn snapshot_state_vec(&self, memory: SnapshotMemoryMode) -> Result<Vec<u8>> {
         let mut state = AddressSpaceState::default();
         let mut offset = 0;
         let machine_ram = self
             .get_machine_ram()
             .with_context(|| "This address space does not support migration.")?;
-        for region in machine_ram.subregions().iter() {
+        let mut regions = machine_ram.subregions();
+        if memory == SnapshotMemoryMode::External {
+            // Container iteration follows region priority, not RAM addresses.
+            // External exports use the address order from query-mem-mappings.
+            regions.sort_by_key(|region| region.offset().raw_value());
+        }
+        for region in &regions {
             state.ram_region_state.push(RamRegionState {
                 name: region.name.clone(),
-                offset,
+                offset: if memory == SnapshotMemoryMode::External {
+                    region.offset().raw_value()
+                } else {
+                    offset
+                },
                 size: region.size(),
             });
             offset += region.size();
@@ -456,6 +501,12 @@ impl StateTransfer for AddressSpace {
 
         Ok(serde_json::to_vec(&state)?)
     }
+}
+
+impl StateTransfer for AddressSpace {
+    fn get_state_vec(&self) -> Result<Vec<u8>> {
+        self.snapshot_state_vec(SnapshotMemoryMode::Full)
+    }
 
     fn get_device_alias(&self) -> u64 {
         self.root().size()
@@ -472,7 +523,7 @@ impl MigrationHook for AddressSpace {
 
     fn save_memory(&self, fd: &mut File, memory: SnapshotMemoryMode) -> Result<()> {
         // Save address space header.
-        let ram_state = self.get_state_vec()?;
+        let ram_state = self.snapshot_state_vec(memory)?;
         let data_slice = get_state_slice(&ram_state)
             .with_context(|| "Failed to get state slice while saving state")?;
         fd.write_all(&data_slice)?;
@@ -498,7 +549,12 @@ impl MigrationHook for AddressSpace {
         match mode {
             // The memory file is already mmap'ed as the RAM backend; just move
             // the cursor past the RAM data.
-            RestoreMode::Mapped => self.skip_mapped_ram_from_snapshot(memory)?,
+            RestoreMode::Mapped => {
+                self.skip_mapped_ram_from_snapshot(memory, SnapshotMemoryMode::Full)?
+            }
+            RestoreMode::MappedExternal => {
+                self.skip_mapped_ram_from_snapshot(memory, SnapshotMemoryMode::External)?
+            }
             RestoreMode::Copy => {
                 if let Some(machine_ram) = self.get_machine_ram() {
                     let _ = read_address_space_state(memory)?;
@@ -576,30 +632,48 @@ pub fn read_state_slice(file: &mut File) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    use std::io::Seek;
-    use std::sync::Arc;
+    use crate::{create_backend_mem, create_default_mem, MemoryBackendMode};
+    use machine_manager::config::{MachineMemConfig, VmConfig};
+    use std::os::unix::fs::FileExt;
+    use vmm_sys_util::tempfile::TempFile;
+
+    fn space_with_regions(regions: Vec<Region>) -> Arc<AddressSpace> {
+        let size = regions.iter().map(Region::size).sum();
+        let root = Region::init_container_region(size, "root");
+        let machine_ram = Arc::new(Region::init_container_region(size, "machine-ram"));
+        let mut offset = 0;
+        for region in regions {
+            let size = region.size();
+            machine_ram
+                .add_subregion_not_update(region, offset)
+                .unwrap();
+            offset += size;
+        }
+        root.add_subregion(
+            Region::init_alias_region(machine_ram.clone(), 0, size, "ram-alias"),
+            0,
+        )
+        .unwrap();
+        AddressSpace::new(root, "space", Some(machine_ram)).unwrap()
+    }
 
     #[test]
-    fn test_save_memory_external_skips_guest_ram_bytes() {
-        let root = Region::init_container_region(0x1000, "root");
-        let machine_ram = Arc::new(Region::init_container_region(0x1000, "machine-ram"));
-        let mem = Arc::new(
-            HostMemMapping::new(GuestAddress(0), None, 0x1000, None, false, false, false).unwrap(),
-        );
-        let ram_region = Region::init_ram_region(mem, "ram");
-        machine_ram.add_subregion_not_update(ram_region, 0).unwrap();
-        let space = AddressSpace::new(root, "space", Some(machine_ram)).unwrap();
-        let metadata_path = std::env::temp_dir().join(format!(
-            "stratovirt-address-space-metadata-{}",
-            std::process::id()
-        ));
-        let full_path = std::env::temp_dir().join(format!(
-            "stratovirt-address-space-full-{}",
-            std::process::id()
-        ));
-        let mut metadata_file = File::create(&metadata_path).unwrap();
-        let mut full_file = File::create(&full_path).unwrap();
-
+    fn test_external_backend_restore_preserves_cow_and_metadata_cursor() {
+        let mut config = MachineMemConfig {
+            mem_size: 0x1000,
+            ..Default::default()
+        };
+        let space = space_with_regions(vec![create_default_mem(
+            &config,
+            1,
+            MemoryBackendMode::Allocate,
+        )
+        .unwrap()]);
+        space
+            .write_object(&42_u8, GuestAddress(0), AddressAttr::Ram)
+            .unwrap();
+        let mut metadata_file = TempFile::new().unwrap().into_file();
+        let mut full_file = TempFile::new().unwrap().into_file();
         space
             .save_memory(&mut metadata_file, SnapshotMemoryMode::External)
             .unwrap();
@@ -609,8 +683,151 @@ mod tests {
 
         let metadata_len = metadata_file.stream_position().unwrap();
         let full_len = full_file.stream_position().unwrap();
-        let _ = std::fs::remove_file(metadata_path);
-        let _ = std::fs::remove_file(full_path);
         assert_eq!(full_len - metadata_len, 0x1000);
+        // Stand in for the following RamList section to catch an incorrect seek.
+        metadata_file.write_all(b"ram-list").unwrap();
+
+        let raw = TempFile::new().unwrap();
+        raw.as_file().set_len(0x1000).unwrap();
+        raw.as_file().write_all_at(&[42], 0).unwrap();
+        config.mem_path = Some(raw.as_path().to_str().unwrap().to_string());
+        let restored = space_with_regions(vec![create_default_mem(
+            &config,
+            1,
+            MemoryBackendMode::Snapshot,
+        )
+        .unwrap()]);
+        metadata_file.rewind().unwrap();
+        restored
+            .validate_external_ram_from_snapshot(&mut metadata_file)
+            .unwrap();
+        assert_eq!(
+            restored
+                .read_object::<u8>(GuestAddress(0), AddressAttr::Ram)
+                .unwrap(),
+            42
+        );
+        restored
+            .write_object(&99_u8, GuestAddress(0), AddressAttr::Ram)
+            .unwrap();
+        let mut value = [0];
+        raw.as_file().read_exact_at(&mut value, 0).unwrap();
+        assert_eq!(value, [42]);
+        metadata_file.rewind().unwrap();
+        restored
+            .restore_memory(&mut metadata_file, &RestoreMode::MappedExternal)
+            .unwrap();
+        assert_eq!(metadata_file.stream_position().unwrap(), metadata_len);
+        let mut marker = [0; 8];
+        metadata_file.read_exact(&mut marker).unwrap();
+        assert_eq!(&marker, b"ram-list");
+
+        // A full snapshot still supplies its own RAM for mapped and copy restore.
+        let mapped = AddressSpace::new(
+            Region::init_container_region(0x1000, "root"),
+            "mapped",
+            Some(Arc::new(Region::init_container_region(
+                0x1000,
+                "machine-ram",
+            ))),
+        )
+        .unwrap();
+        full_file.rewind().unwrap();
+        mapped
+            .build_mapped_ram_from_snapshot(&mut full_file)
+            .unwrap();
+        assert_eq!(
+            mapped
+                .read_object::<u8>(GuestAddress(0), AddressAttr::Ram)
+                .unwrap(),
+            42
+        );
+        full_file.rewind().unwrap();
+        mapped
+            .restore_memory(&mut full_file, &RestoreMode::Mapped)
+            .unwrap();
+        assert_eq!(full_file.stream_position().unwrap(), full_len);
+        full_file.rewind().unwrap();
+        restored
+            .restore_memory(&mut full_file, &RestoreMode::Copy)
+            .unwrap();
+        assert_eq!(
+            restored
+                .read_object::<u8>(GuestAddress(0), AddressAttr::Ram)
+                .unwrap(),
+            42
+        );
+        assert_eq!(full_file.stream_position().unwrap(), full_len);
+    }
+
+    #[test]
+    fn test_external_backend_restore_checks_each_region_and_alias() {
+        let mut vm_config = VmConfig::default();
+        let mut files = Vec::new();
+        let mut regions = Vec::new();
+        for (id, value) in [("ram0", 42), ("ram1", 84)] {
+            let raw = TempFile::new().unwrap();
+            raw.as_file().set_len(0x1000).unwrap();
+            raw.as_file().write_all_at(&[value], 0).unwrap();
+            let config = vm_config
+                .add_mem_backend(&format!(
+                    "memory-backend-file,id={id},size=4K,share=off,mem-path={}",
+                    raw.as_path().display()
+                ))
+                .unwrap();
+            regions.push(create_backend_mem(&config, 1, MemoryBackendMode::Snapshot).unwrap());
+            files.push(raw);
+        }
+        let space = space_with_regions(regions);
+        assert_eq!(
+            space
+                .read_object::<u8>(GuestAddress(0), AddressAttr::Ram)
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            space
+                .read_object::<u8>(GuestAddress(0x1000), AddressAttr::Ram)
+                .unwrap(),
+            84
+        );
+        space
+            .write_object(&99_u8, GuestAddress(0x1000), AddressAttr::Ram)
+            .unwrap();
+        let mut value = [0];
+        files[1].as_file().read_exact_at(&mut value, 0).unwrap();
+        assert_eq!(value, [84]);
+
+        let mut metadata = TempFile::new().unwrap().into_file();
+        space
+            .save_memory(&mut metadata, SnapshotMemoryMode::External)
+            .unwrap();
+        metadata.rewind().unwrap();
+        let state = read_address_space_state(&mut metadata).unwrap();
+        assert_eq!(state.ram_region_state[0].name, "ram0");
+        assert_eq!(state.ram_region_state[1].offset, 0x1000);
+        space.validate_external_ram_layout(&state).unwrap();
+        let mut invalid = state.clone();
+        invalid.total_region_size += 0x1000;
+        assert!(space.validate_external_ram_layout(&invalid).is_err());
+        let mut invalid = state.clone();
+        invalid.ram_region_state[0].name = "wrong".to_string();
+        assert!(space.validate_external_ram_layout(&invalid).is_err());
+        let mut invalid = state.clone();
+        invalid.ram_region_state[1] = invalid.ram_region_state[0].clone();
+        assert!(space.validate_external_ram_layout(&invalid).is_err());
+        let mut invalid = state.clone();
+        invalid.ram_region_state[1].offset = 0;
+        assert!(space.validate_external_ram_layout(&invalid).is_err());
+        let mut invalid = state.clone();
+        invalid.ram_region_state[0].size += 0x1000;
+        invalid.total_region_size += 0x1000;
+        assert!(space.validate_external_ram_layout(&invalid).is_err());
+        let mut invalid = state.clone();
+        invalid.alias_region_state[0].alias_offset = 0x1000;
+        assert!(space.validate_external_ram_layout(&invalid).is_err());
+        let mut invalid = state.clone();
+        invalid.alias_region_state.clear();
+        assert!(space.validate_external_ram_layout(&invalid).is_err());
     }
 }
