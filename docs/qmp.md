@@ -576,6 +576,25 @@ Delete disk internal snapshot.
 <- { "return": { "id": "1", "name": "snapshot0", "vm-state-size": 0, "date-sec": 1000012, "date-nsec": 10, "vm-clock-sec": 100, vm-clock-nsec": 20, "icount": 220414 } }
 ```
 
+## Incremental memory tracking
+
+With `-incoming file:PATH,uffd-track-dirty=true`, the VM tracks RAM writes before it
+starts executing. The option defaults to false.
+
+### query-mem-dirty-bitmap
+
+Pause the VM and quiesce all RAM writers before querying. The command returns the
+current dirty bitmap and re-arms write protection for the next epoch:
+
+```json
+-> {"execute":"query-mem-dirty-bitmap"}
+<- {"return":{"bitmap":[5],"page-size":4096}}
+```
+
+This reports pages 0 and 2 in the flat RAM order returned by `query-mem-mappings`.
+Capture the selected pages while writers remain quiesced before resuming the VM.
+See [snapshot.md](snapshot.md#incremental-memory-tracking) for the restore option.
+
 ## Debug
 
 ### query-vcpu-reg

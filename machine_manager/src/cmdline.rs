@@ -326,7 +326,7 @@ pub fn create_args_parser<'a>() -> ArgParser<'a> {
             .value_name("<parameters>")
             .help("\n\t\tdo the migration using tcp socket: -incoming tcp:<ip>:<port>; \
                    \n\t\tdo the migration using unix socket: -incoming unix:<socket path>; \
-                   \n\t\tdo the virtual machine snapshot: -incoming file:<file path>")
+                   \n\t\trestore a snapshot: -incoming file:<directory>[,mapped=<true|false>][,uffd-track-dirty=<true|false>]")
             .takes_value(true),
         )
         .arg(

@@ -889,6 +889,13 @@ pub trait MachineOps: MachineLifecycle {
             );
         }
 
+        // When requested, track the parent mapping before device realization
+        // or restore can modify RAM.
+        if migrate_info.uffd_track_dirty.unwrap_or(false) {
+            address_space::uffd::start_dirty_tracking(self.get_vm_ram())
+                .context("Failed to enable dirty tracking for mapped snapshot RAM")?;
+        }
+
         Ok(())
     }
 
@@ -3502,7 +3509,11 @@ fn start_incoming_migration(
 
             MigrationManager::set_status(MigrationStatus::Active)?;
             MigrationManager::notify_status(false, MigrationStatus::Active)?;
-            let ret = MigrationManager::restore_snapshot(&path, restore_mode);
+            let ret = MigrationManager::restore_snapshot(
+                &path,
+                restore_mode,
+                migrate_info.uffd_track_dirty.unwrap_or(false),
+            );
             if ret.is_err() {
                 let _ = MigrationManager::set_status(MigrationStatus::Failed);
                 if let Err(e) = MigrationManager::notify_status(false, MigrationStatus::Failed) {

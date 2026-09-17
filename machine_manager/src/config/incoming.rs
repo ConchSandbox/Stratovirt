@@ -78,6 +78,9 @@ pub struct IncomingConfig {
     pub uffd_sock: Option<String>,
     #[arg(long = "memory", default_value = "full")]
     pub memory: SnapshotMemoryMode,
+    // Opt in to standalone WP_ASYNC tracking before snapshot execution begins.
+    #[arg(long = "uffd-track-dirty", action = ArgAction::Set)]
+    pub uffd_track_dirty: Option<bool>,
 }
 
 impl Default for IncomingConfig {
@@ -88,6 +91,7 @@ impl Default for IncomingConfig {
             mapped: true,
             uffd_sock: None,
             memory: SnapshotMemoryMode::Full,
+            uffd_track_dirty: None,
         }
     }
 }
@@ -142,6 +146,13 @@ impl IncomingConfig {
             bail!("memory=external is only valid with file mode");
         }
 
+        if self.uffd_track_dirty.is_some() && self.mode != MigrateMode::File {
+            bail!("uffd-track-dirty is only valid with file snapshot restore");
+        }
+        if self.uffd_track_dirty.is_some() && self.uffd_sock.is_some() {
+            bail!("uffd-track-dirty controls standalone tracking and cannot be combined with uffd_sock");
+        }
+
         Ok(())
     }
 
@@ -161,6 +172,10 @@ impl IncomingConfig {
 
     fn check_migrate_valid(&self) -> Result<()> {
         self.check_common_valid()?;
+
+        if self.uffd_track_dirty.is_some() {
+            bail!("uffd-track-dirty is only valid with incoming snapshot restore");
+        }
 
         if self.uffd_sock.is_some() {
             bail!("uffd_sock is only valid with incoming snapshot restore");
@@ -248,6 +263,7 @@ mod tests {
         assert_eq!(result_6.mapped, true);
         assert_eq!(result_6.uffd_sock, None);
         assert_eq!(result_6.memory, SnapshotMemoryMode::Full);
+        assert_eq!(result_6.uffd_track_dirty, None);
 
         let incoming_case7 = "file:/tmp/incoming_file,mapped=false";
         let result7 = parse_incoming_uri(incoming_case7);
@@ -294,6 +310,17 @@ mod tests {
 
         let bad_memory_mode = "file:/tmp/snap,memory=unknown";
         assert!(parse_incoming_uri(bad_memory_mode).is_err());
+
+        for enabled in [true, false] {
+            let uri = format!("file:/tmp/snap,uffd-track-dirty={enabled}");
+            assert_eq!(
+                parse_incoming_uri(&uri).unwrap().uffd_track_dirty,
+                Some(enabled)
+            );
+        }
+        let bad_tracking =
+            "file:/tmp/snap,mapped=false,uffd_sock=/run/uffd.sock,uffd-track-dirty=true";
+        assert!(parse_incoming_uri(bad_tracking).is_err());
     }
 
     #[test]
@@ -337,6 +364,7 @@ mod tests {
                 mapped: true,
                 uffd_sock: None,
                 memory: SnapshotMemoryMode::Full,
+                uffd_track_dirty: None,
             }
         );
 
@@ -352,6 +380,7 @@ mod tests {
                 mapped: true,
                 uffd_sock: None,
                 memory: SnapshotMemoryMode::Full,
+                uffd_track_dirty: None,
             }
         );
 
@@ -370,6 +399,7 @@ mod tests {
                 mapped: false,
                 uffd_sock: None,
                 memory: SnapshotMemoryMode::Full,
+                uffd_track_dirty: None,
             }
         );
 
@@ -386,6 +416,7 @@ mod tests {
                 mapped: false,
                 uffd_sock: Some("/run/uffd.sock".to_string()),
                 memory: SnapshotMemoryMode::Full,
+                uffd_track_dirty: None,
             }
         );
 
@@ -401,6 +432,7 @@ mod tests {
                 mapped: false,
                 uffd_sock: Some("/run/uffd.sock".to_string()),
                 memory: SnapshotMemoryMode::External,
+                uffd_track_dirty: None,
             }
         );
     }

@@ -57,6 +57,34 @@ $ ./stratovirt \
 
 The device configuration must be the same with template VM. Its cpu number, guest memory size, device number and type can be changed. For drive file, only support previous file or its backups. After that, the VM is created from template successfully.
 
+## Incremental memory tracking
+
+Enable the existing UFFD WP_ASYNC dirty tracker without an external page-fault
+handler by adding `uffd-track-dirty=true` to snapshot restore:
+
+```text
+-incoming file:/path/to/snapshot,uffd-track-dirty=true
+-incoming file:/path/to/snapshot,mapped=false,uffd-track-dirty=true
+```
+
+The option defaults to false and cannot be combined with `uffd_sock`. Requested
+tracking requires `UFFD_FEATURE_WP_ASYNC`; initialization fails if unavailable.
+Mapped RAM is protected before device initialization; copy mode is protected after
+RAM loading and before device restore. No `-S` or manual `cont` is needed.
+
+At each checkpoint, pause the VM and quiesce all RAM writers, then use the existing
+query interface:
+
+```json
+{"execute":"query-mem-dirty-bitmap"}
+```
+
+The result contains `bitmap` (64-bit words) and `page-size` (bytes), with pages
+numbered in `query-mem-mappings` order. Each query resets tracking for the next
+round. Keep RAM writers paused until the selected pages and VM state are saved.
+During tracking, keep mappings stable and avoid page discard or writes through
+other aliases or previously pinned DMA buffers.
+
 ## Snapshot state check
 
 Use QMP command `query-migrate` to check snapshot state:

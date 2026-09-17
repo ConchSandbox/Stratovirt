@@ -125,6 +125,12 @@ pub trait MigrationHook: StateTransfer {
         Ok(())
     }
 
+    /// Start RAM dirty tracking before restoring or resuming device state.
+    /// Memory implementations preserve any epoch already started during mapping.
+    fn start_dirty_tracking(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Send memory data to `Write` trait.
     ///
     /// # Arguments

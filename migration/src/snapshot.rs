@@ -160,7 +160,11 @@ impl MigrationManager {
     ///
     /// * `path` - snapshot dir path.
     /// * `mode` - how guest memory is provided (see [`RestoreMode`]).
-    pub fn restore_snapshot(path: &str, mode: RestoreMode) -> Result<()> {
+    /// * `uffd_track_dirty` - enable standalone tracking before restoring devices.
+    pub fn restore_snapshot(path: &str, mode: RestoreMode, uffd_track_dirty: bool) -> Result<()> {
+        if uffd_track_dirty && matches!(mode, RestoreMode::Uffd { .. }) {
+            bail!("Standalone dirty tracking cannot be combined with external UFFD restore");
+        }
         let mut snapshot_path = PathBuf::from(path);
         if !snapshot_path.is_dir() {
             return Err(anyhow!(MigrationError::InvalidSnapshotPath));
@@ -198,6 +202,22 @@ impl MigrationManager {
             bail!("Invalid device state snapshot file");
         }
 
+        if uffd_track_dirty {
+            // Establish tracking before GPU/device restore can write to RAM.
+            // Mapped RAM is already tracked; the hook preserves that epoch.
+            Self::restore_memory(&mut memory_file, &mode)
+                .with_context(|| "Failed to load snapshot memory")?;
+            MIGRATION_MANAGER
+                .vmm
+                .read()
+                .unwrap()
+                .memory
+                .as_ref()
+                .unwrap()
+                .start_dirty_tracking()
+                .context("Failed to enable snapshot memory dirty tracking")?;
+        }
+
         let ret = Arc::new(AtomicBool::new(true));
         let gpu_ret = ret.clone();
         let gpu_path = path.to_string();
@@ -213,8 +233,11 @@ impl MigrationManager {
                 });
             })?;
 
-        Self::restore_memory(&mut memory_file, &mode)
-            .with_context(|| "Failed to load snapshot memory")?;
+        if !uffd_track_dirty {
+            // Without tracking, RAM loading can overlap GPU restore.
+            Self::restore_memory(&mut memory_file, &mode)
+                .with_context(|| "Failed to load snapshot memory")?;
+        }
         let snapshot_desc_db =
             Self::restore_desc_db(&mut device_state_file, device_state_header.desc_len)
                 .with_context(|| "Failed to load device descriptor db")?;

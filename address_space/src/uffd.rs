@@ -25,6 +25,8 @@ use util::bitmap::set_dense_bitmap_bit;
 use util::unix::{host_page_size, PagemapBatchReader, PagemapEntry};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::{AddressAttr, Region, RegionType};
+
 // ────────────────────────────────────────────────────────────────────────────
 // Linux userfaultfd constants (not yet exposed by libc 0.2 / nix 0.26)
 // ────────────────────────────────────────────────────────────────────────────
@@ -104,8 +106,10 @@ struct RegionMapping {
 
 /// UFFD memory backend: registers guest RAM with a userfaultfd and hands the
 /// fd to the external uffd daemon so it can serve page faults from a snapshot source.
+/// Also supports WP-only dirty tracking without an external uffd daemon.
 pub struct UffdMemoryBackend {
-    socket_path: PathBuf,
+    // None selects WP-only tracking, with no external missing-page handler.
+    socket_path: Option<PathBuf>,
     /// Collected RAM regions (host addr, size, cumulative offset).
     regions: Vec<(u64, u64, u64)>,
     uffd_fd: RawFd,
@@ -117,9 +121,14 @@ impl UffdMemoryBackend {
     /// Create a new backend that will connect to `socket_path` when
     /// [`Self::send_to_external_uffd_daemon`] is called.
     pub fn new(socket_path: &str) -> Result<Self> {
-        let (uffd_fd, wp_async) = create_uffd().context("failed to create userfaultfd")?;
+        Self::create(Some(socket_path))
+    }
+
+    fn create(socket_path: Option<&str>) -> Result<Self> {
+        let (uffd_fd, wp_async) =
+            create_uffd(socket_path.is_none()).context("failed to create userfaultfd")?;
         Ok(UffdMemoryBackend {
-            socket_path: PathBuf::from(socket_path),
+            socket_path: socket_path.map(PathBuf::from),
             regions: Vec::new(),
             uffd_fd,
             wp_async,
@@ -127,13 +136,14 @@ impl UffdMemoryBackend {
         })
     }
 
-    /// Register a guest RAM region with the userfaultfd (MISSING fault mode).
+    /// Register RAM for external MISSING-mode restore or WP-only tracking.
     ///
     /// * `host_addr` – host virtual address of the region start.
     /// * `size`      – size in bytes.
     /// * `offset`    – byte offset of this region in the flat snapshot file.
     ///
-    /// Before registering, the region is cleared with MADV_DONTNEED.
+    /// In external MISSING mode, the region is first cleared with MADV_DONTNEED.
+    /// WP-only mode preserves the existing mapping and its contents.
     /// UFFDIO_REGISTER does not evict pages that are already present: any
     /// page populated before registration (mem-prealloc touching every page,
     /// guest RAM accesses during the device-state restore that runs earlier,
@@ -147,23 +157,27 @@ impl UffdMemoryBackend {
         // SAFETY: host_addr points to a valid anonymous mapping of exactly `size` bytes
         // belonging to this guest RAM region; the region remains alive for the duration
         // of this call.
-        let ret = unsafe {
-            libc::madvise(
-                host_addr as *mut libc::c_void,
-                size as libc::size_t,
-                libc::MADV_DONTNEED,
-            )
-        };
-        if ret != 0 {
-            bail!(
-                "madvise(MADV_DONTNEED) failed for [{:#x}, +{:#x}): {}",
-                host_addr,
-                size,
-                std::io::Error::last_os_error()
-            );
+        if self.socket_path.is_some() {
+            let ret = unsafe {
+                libc::madvise(
+                    host_addr as *mut libc::c_void,
+                    size as libc::size_t,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if ret != 0 {
+                bail!(
+                    "madvise(MADV_DONTNEED) failed for [{:#x}, +{:#x}): {}",
+                    host_addr,
+                    size,
+                    std::io::Error::last_os_error()
+                );
+            }
         }
 
-        let mode = if self.wp_async {
+        let mode = if self.socket_path.is_none() {
+            UFFDIO_REGISTER_MODE_WP
+        } else if self.wp_async {
             UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP
         } else {
             UFFDIO_REGISTER_MODE_MISSING
@@ -205,7 +219,11 @@ impl UffdMemoryBackend {
         let json = serde_json::to_vec(&self.region_mappings(page_size))
             .context("failed to serialise region mappings")?;
 
-        let stream = send_fd_with_json(&self.socket_path, self.uffd_fd, &json)
+        let socket_path = self
+            .socket_path
+            .as_ref()
+            .context("WP-only tracking does not use an external UFFD handler")?;
+        let stream = send_fd_with_json(socket_path, self.uffd_fd, &json)
             .context("failed to send uffd fd to external uffd daemon")?;
         self.handoff_stream = Some(stream);
 
@@ -228,6 +246,46 @@ impl UffdMemoryBackend {
 /// Keep the UFFD fd alive in StratoVirt and make dirty bitmap queries available.
 pub fn store_uffd_backend(backend: UffdMemoryBackend) {
     *backend_state().lock().unwrap() = Some(backend);
+}
+
+/// Start tracking existing RAM without a MISSING registration or socket handoff.
+/// The caller must establish the baseline before any RAM writer runs. Repeated
+/// initialization preserves the epoch started during mapped-RAM restoration.
+pub fn start_dirty_tracking(machine_ram: &Region) -> Result<()> {
+    let mut ram: Vec<Region> = machine_ram
+        .subregions()
+        .into_iter()
+        .filter(|region| region.region_type() == RegionType::Ram)
+        .collect();
+    ram.sort_by_key(|region| region.offset().raw_value());
+    let mut regions = Vec::with_capacity(ram.len());
+    let mut offset = 0_u64;
+    for region in ram {
+        // SAFETY: the RAM region owns its mapping for the VM lifetime.
+        let addr = unsafe { region.get_host_address(AddressAttr::Ram) }
+            .with_context(|| format!("RAM region {} has no host mapping", region.name))?;
+        regions.push((addr, region.size(), offset));
+        offset = offset
+            .checked_add(region.size())
+            .context("RAM size overflow")?;
+    }
+    if regions.is_empty() {
+        bail!("No RAM mappings to track");
+    }
+    let mut state = backend_state().lock().unwrap();
+    if let Some(backend) = state.as_ref() {
+        if backend.socket_path.is_some() || backend.regions != regions {
+            bail!("UFFD backend is already registered with a different mode or RAM layout");
+        }
+        return Ok(());
+    }
+    let mut backend = UffdMemoryBackend::create(None)?;
+    for (addr, size, offset) in regions {
+        backend.register_region(addr, size, offset)?;
+    }
+    write_protect_mappings(&backend, true)?;
+    *state = Some(backend);
+    Ok(())
 }
 
 fn build_bitmap_from_pagemap<F>(
@@ -362,7 +420,7 @@ impl Drop for UffdMemoryBackend {
 // Helper: create userfaultfd
 // ────────────────────────────────────────────────────────────────────────────
 
-fn create_uffd() -> Result<(RawFd, bool)> {
+fn create_uffd(wp_only: bool) -> Result<(RawFd, bool)> {
     // O_CLOEXEC = 0x80000 on both x86_64 and aarch64
     // SAFETY: SYS_USERFAULTFD_NR is the correct syscall number for this architecture;
     // O_CLOEXEC | O_NONBLOCK are valid flags accepted by userfaultfd(2).
@@ -375,8 +433,19 @@ fn create_uffd() -> Result<(RawFd, bool)> {
     }
     let fd = fd as RawFd;
 
-    match enable_uffd_api(fd, UFFD_FEATURE_EVENT_REMOVE | UFFD_FEATURE_WP_ASYNC) {
+    let features = UFFD_FEATURE_WP_ASYNC
+        | if wp_only {
+            0
+        } else {
+            UFFD_FEATURE_EVENT_REMOVE
+        };
+    match enable_uffd_api(fd, features) {
         Ok(()) => Ok((fd, true)),
+        Err(err) if wp_only => {
+            // SAFETY: this function still owns the fd after failed initialization.
+            unsafe { libc::close(fd) };
+            Err(err).context("Standalone dirty tracking requires UFFD_FEATURE_WP_ASYNC")
+        }
         Err(wp_err) => match enable_uffd_api(fd, UFFD_FEATURE_EVENT_REMOVE) {
             Ok(()) => Ok((fd, false)),
             Err(err) => {
@@ -490,7 +559,7 @@ mod tests {
     #[test]
     fn test_region_mappings_use_registered_offsets() {
         let backend = UffdMemoryBackend {
-            socket_path: PathBuf::from("/tmp/unused.sock"),
+            socket_path: Some(PathBuf::from("/tmp/unused.sock")),
             regions: vec![(0x1000, 0x2000, 0), (0x8000, 0x1000, 0x2000)],
             uffd_fd: -1,
             wp_async: false,
@@ -571,7 +640,7 @@ mod tests {
         }
 
         let mut backend = UffdMemoryBackend {
-            socket_path: PathBuf::from("/tmp/unused.sock"),
+            socket_path: Some(PathBuf::from("/tmp/unused.sock")),
             regions: vec![(ptr as u64, size as u64, 0)],
             uffd_fd: -1,
             wp_async: false,

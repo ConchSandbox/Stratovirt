@@ -463,6 +463,13 @@ impl StateTransfer for AddressSpace {
 }
 
 impl MigrationHook for AddressSpace {
+    fn start_dirty_tracking(&self) -> Result<()> {
+        let machine_ram = self
+            .get_machine_ram()
+            .context("This address space does not support snapshot dirty tracking")?;
+        crate::uffd::start_dirty_tracking(machine_ram)
+    }
+
     fn save_memory(&self, fd: &mut File, memory: SnapshotMemoryMode) -> Result<()> {
         // Save address space header.
         let ram_state = self.get_state_vec()?;
