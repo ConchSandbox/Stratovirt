@@ -320,6 +320,8 @@ pub fn create_args_parser<'a>() -> ArgParser<'a> {
             .takes_value(false)
             .required(false),
         )
+        .arg(Arg::with_name("mem-map").long("mem-map").value_name("<path>").takes_value(true).help("Conch cumulative RAM index for external mapped restore"))
+        .arg(Arg::with_name("mem-map-sources").long("mem-map-sources").value_name("<path>").takes_value(true).help("Conch RAM source-directory bindings"))
         .arg(
             Arg::with_name("incoming")
             .long("incoming")
@@ -565,6 +567,8 @@ pub fn create_vmconfig(args: &ArgMatches) -> Result<VmConfig> {
     // VmConfig can be transformed by json file which described VmConfig
     // directly.
     let mut vm_cfg = VmConfig::default();
+    vm_cfg.machine_config.mem_config.mem_map = args.value_of("mem-map");
+    vm_cfg.machine_config.mem_config.mem_map_sources = args.value_of("mem-map-sources");
 
     // Parse cmdline args which need to set in VmConfig
     add_args_to_config!((args.value_of("name")), vm_cfg, add_name);

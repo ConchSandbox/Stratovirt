@@ -50,6 +50,7 @@ const UFFD_FEATURE_WP_HUGETLBFS_SHMEM: u64 = 1 << 12;
 // UFFD_FEATURE_WP_ASYNC: write-protect faults are cleared by the kernel
 // automatically (no UFFD event), which is required for UFFDIO_COPY_MODE_WP.
 const UFFD_FEATURE_WP_ASYNC: u64 = 1 << 15;
+const UFFD_FEATURE_WP_UNPOPULATED: u64 = 1 << 13;
 
 #[repr(C)]
 struct UffdioApi {
@@ -115,6 +116,7 @@ pub struct UffdMemoryBackend {
     handoff_stream: Option<UnixStream>,
     // Start of RAM data in the snapshot source file (zero for external RAM).
     snapfile_offset: u64,
+    standalone: bool,
 }
 
 impl UffdMemoryBackend {
@@ -133,6 +135,7 @@ impl UffdMemoryBackend {
             wp_async,
             handoff_stream: None,
             snapfile_offset,
+            standalone: false,
         })
     }
 
@@ -246,6 +249,102 @@ impl UffdMemoryBackend {
 
         Ok(())
     }
+}
+
+/// Start strict WP-only tracking before any device restoration can write RAM.
+/// Regions use (host address, length, flat RAM offset), in logical RAM order.
+/// Repeating initialization for the same VM never resets an existing epoch.
+pub fn initialize_indexed_tracking(regions: &[(u64, u64, u64)]) -> Result<()> {
+    let mut stored = backend_state().lock().unwrap();
+    if let Some(existing) = stored.as_ref() {
+        if existing.standalone
+            && existing.regions.len() == regions.len()
+            && existing
+                .regions
+                .iter()
+                .zip(regions)
+                .all(|(a, b)| (a.base_host_virt_addr, a.size, a.offset) == *b)
+        {
+            return Ok(());
+        }
+        bail!("dirty tracking already owns different RAM mappings");
+    }
+    if host_page_size() != 4096 || regions.is_empty() {
+        bail!("indexed dirty tracking requires 4096-byte RAM pages");
+    }
+    // Kernel-originated writers (KVM and vhost) are included; USER_MODE_ONLY
+    // would not satisfy this contract and is deliberately not requested.
+    // SAFETY: syscall number and flags match the supported Linux architectures.
+    let fd = unsafe { libc::syscall(SYS_USERFAULTFD_NR, libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("create indexed WP_ASYNC userfaultfd");
+    }
+    let mut backend = UffdMemoryBackend {
+        socket_path: PathBuf::new(),
+        regions: Vec::new(),
+        features: 0,
+        uffd_fd: fd as RawFd,
+        wp_async: true,
+        handoff_stream: None,
+        snapfile_offset: 0,
+        standalone: true,
+    };
+    let required = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED;
+    backend.features = enable_uffd_api(backend.uffd_fd, required)
+        .context("indexed RAM requires WP_ASYNC and WP_UNPOPULATED")?;
+    if backend.features & required != required {
+        bail!("kernel lacks mandatory indexed RAM write-protection features");
+    }
+    let mut next = 0;
+    for &(address, size, offset) in regions {
+        if address == 0
+            || address % 4096 != 0
+            || size == 0
+            || size % 4096 != 0
+            || offset != next
+            || address.checked_add(size).is_none()
+        {
+            bail!("invalid indexed RAM tracking range");
+        }
+        next = next
+            .checked_add(size)
+            .context("indexed tracking size overflow")?;
+        let mut registration = UffdioRegister {
+            range: UffdioRange {
+                start: address,
+                len: size,
+            },
+            mode: UFFDIO_REGISTER_MODE_WP,
+            ioctls: 0,
+        };
+        // SAFETY: the caller retains these validated mappings for the VM lifetime.
+        let ret = unsafe {
+            libc::ioctl(
+                backend.uffd_fd,
+                UFFDIO_REGISTER as _,
+                &mut registration as *mut _,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "register indexed file mapping [{address:#x}, +{size:#x}) for WP-only tracking"
+                )
+            });
+        }
+        if registration.ioctls & (1 << 6) == 0 {
+            bail!("indexed RAM mapping does not support UFFDIO_WRITEPROTECT");
+        }
+        backend.regions.push(RegionMapping {
+            base_host_virt_addr: address,
+            size,
+            offset,
+            page_size_kib: 4096,
+        });
+    }
+    write_protect_mappings(&backend, true).context("protect initial indexed RAM epoch")?;
+    *stored = Some(backend);
+    Ok(())
 }
 
 /// Keep the UFFD fd alive in StratoVirt and make dirty bitmap queries available.
@@ -385,7 +484,19 @@ fn write_protect_mappings(backend: &UffdMemoryBackend, enabled: bool) -> Result<
 ///      every query.
 fn query_and_reset_dirty_bitmap_impl(backend: &mut UffdMemoryBackend) -> Result<MemDirtyBitmap> {
     if backend.wp_async {
-        let bitmap = build_dirty_bitmap(backend)?;
+        let mut bitmap = build_dirty_bitmap(backend)?;
+        if backend.standalone {
+            let bytes = backend
+                .regions
+                .iter()
+                .try_fold(0u64, |end, r| {
+                    r.offset.checked_add(r.size).map(|n| end.max(n))
+                })
+                .context("dirty bitmap size overflow")?;
+            bitmap
+                .bitmap
+                .resize(usize::try_from((bytes / 4096).div_ceil(64))?, 0);
+        }
         write_protect_mappings(backend, true)
             .with_context(|| "Failed to reset UFFD-WP dirty tracking")?;
         return Ok(bitmap);
@@ -619,6 +730,7 @@ mod tests {
             wp_async: false,
             handoff_stream: None,
             snapfile_offset: 0,
+            standalone: false,
         };
 
         // Write pages 0 and 2, leave 1 and 3 untouched so only 0 and 2 are
@@ -649,5 +761,275 @@ mod tests {
 
         // SAFETY: the mapping established above is still valid.
         unsafe { libc::munmap(ptr, size) };
+    }
+}
+
+#[cfg(test)]
+mod indexed_tracking_tests {
+    use super::*;
+    use crate::{FileBackend, GuestAddress, HostMemMapping};
+    use std::io::{Read, Seek, Write};
+    use std::sync::Arc;
+    use vmm_sys_util::tempfile::TempFile;
+
+    fn indexed_page_observations(
+        mapping: &HostMemMapping,
+        phase: &str,
+    ) -> Vec<(bool, PagemapEntry)> {
+        let mut residency = vec![0u8; (mapping.size() / 4096) as usize];
+        // SAFETY: the live mapping owner retains this entire page-aligned range.
+        assert_eq!(
+            unsafe {
+                libc::mincore(
+                    mapping.host_address() as *mut libc::c_void,
+                    mapping.size() as usize,
+                    residency.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let mut result = Vec::new();
+        PagemapBatchReader::new()
+            .unwrap()
+            .scan_range(
+                mapping.host_address(),
+                mapping.size(),
+                4096,
+                |index, entry| {
+                    result.push((residency[index as usize] & 1 != 0, entry));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        eprintln!(
+            "{}: {:?}",
+            phase,
+            result
+                .iter()
+                .map(|(resident, entry)| (*resident, format!("{:#x}", entry.raw())))
+                .collect::<Vec<_>>()
+        );
+        result
+    }
+
+    fn indexed_mapping_swap_bytes(mapping: &HostMemMapping) -> u64 {
+        let mut selected = false;
+        for line in std::fs::read_to_string("/proc/self/smaps").unwrap().lines() {
+            if let Some((start, end)) = line
+                .split_whitespace()
+                .next()
+                .and_then(|part| part.split_once('-'))
+            {
+                let start = u64::from_str_radix(start, 16).unwrap();
+                let end = u64::from_str_radix(end, 16).unwrap();
+                selected = start <= mapping.host_address() && mapping.host_address() < end;
+                if selected {
+                    assert_eq!(
+                        (start, end - start),
+                        (mapping.host_address(), mapping.size()),
+                        "swap accounting must cover only the owned mapping"
+                    );
+                }
+            } else if selected {
+                if let Some(kib) = line.strip_prefix("Swap:") {
+                    return kib
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                        * 1024;
+                }
+            }
+        }
+        panic!("owned mapping missing from smaps");
+    }
+
+    /// Host qualification test: failure is intentional if mandatory kernel
+    /// facilities or permissions are absent. It is never a resident-page fallback.
+    #[test]
+    #[ignore = "requires kernel WP_ASYNC on private file mappings and privileged userfaultfd"]
+    fn indexed_wp_async_tracks_private_zero_writes_across_epochs() {
+        let file = if let Some(path) = std::env::var_os("CONCH_TEST_EROFS_FILE") {
+            std::fs::File::open(path).unwrap()
+        } else {
+            let mut file = TempFile::new().unwrap().into_file();
+            file.write_all(&vec![7; 8192]).unwrap();
+            file.rewind().unwrap();
+            file
+        };
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            8192,
+            "qualification fixture must contain 8192 bytes of value 7"
+        );
+        let file = Arc::new(file);
+        // Heat the backing cache through read(2), without faulting the RAM VMA.
+        // This is deliberately different from reading through the mapping.
+        let mut heater = file.try_clone().unwrap();
+        heater.rewind().unwrap();
+        let mut hot = vec![0u8; 8192];
+        heater.read_exact(&mut hot).unwrap();
+        assert!(hot.iter().all(|v| *v == 7));
+        let mapping = HostMemMapping::new(
+            GuestAddress(0),
+            None,
+            8192,
+            Some(FileBackend {
+                file: file.clone(),
+                offset: 0,
+                page_size: 4096,
+            }),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let untracked = indexed_page_observations(&mapping, "cache-hot before UFFD registration");
+        assert!(untracked.iter().all(|(_, entry)| !entry.is_resident()));
+        assert!(
+            untracked.iter().all(|(resident, _)| *resident),
+            "fixture did not heat the backing page cache"
+        );
+        let regions = [(mapping.host_address(), 8192, 0)];
+        initialize_indexed_tracking(&regions)
+            .expect("host does not satisfy indexed RAM WP_ASYNC requirements");
+        let protected =
+            indexed_page_observations(&mapping, "cache-hot after WP-only registration/protection");
+        assert!(
+            protected
+                .iter()
+                .all(|(_, entry)| !entry.is_present() && entry.is_uffd_wp()),
+            "registration must leave previously unfaulted pages non-present and protected"
+        );
+        assert_eq!(
+            indexed_mapping_swap_bytes(&mapping),
+            0,
+            "unpopulated WP markers are not swapped COW payloads"
+        );
+        let peer = HostMemMapping::new(
+            GuestAddress(0),
+            None,
+            8192,
+            Some(FileBackend {
+                file: file.clone(),
+                offset: 0,
+                page_size: 4096,
+            }),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        // SAFETY: peer owns both pages; these reads model another instance making
+        // the shared backing cache hot while this instance has no present PTEs.
+        unsafe {
+            assert_eq!(std::ptr::read_volatile(peer.host_address() as *const u8), 7);
+            assert_eq!(
+                std::ptr::read_volatile((peer.host_address() + 4096) as *const u8),
+                7
+            );
+        }
+        indexed_page_observations(
+            &mapping,
+            "after another private mapping reads the cache-hot file",
+        );
+        let first = query_and_reset_dirty_bitmap().unwrap();
+        assert_eq!(first.bitmap, vec![0]);
+        // A read fault creates a present clean PTE, but does not create a dirty page.
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(mapping.host_address() as *const u8) },
+            7
+        );
+        indexed_page_observations(&mapping, "after a clean read fault");
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+        // SAFETY: the owner retains both pages throughout this test.
+        unsafe { std::ptr::write_bytes(mapping.host_address() as *mut u8, 0, 4096) };
+        initialize_indexed_tracking(&regions).unwrap(); // Must preserve existing dirty bits.
+        let second = query_and_reset_dirty_bitmap().unwrap();
+        assert_eq!(second.bitmap, vec![1]);
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+        unsafe { std::ptr::write_volatile((mapping.host_address() + 4096) as *mut u8, 9) };
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![2]);
+        if std::env::var_os("CONCH_TEST_SWAP").is_some() {
+            assert!(
+                std::fs::read_to_string("/proc/swaps")
+                    .unwrap()
+                    .lines()
+                    .count()
+                    > 1,
+                "swap qualification requires an active swap area"
+            );
+            // Both pages are now private COW pages with a clean protected epoch.
+            // PAGEOUT requests reclaim only for this owned 8 KiB test mapping.
+            assert_eq!(
+                unsafe {
+                    libc::madvise(
+                        mapping.host_address() as *mut libc::c_void,
+                        8192,
+                        libc::MADV_PAGEOUT,
+                    )
+                },
+                0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let swapped =
+                indexed_page_observations(&mapping, "protected COW pages after explicit pageout");
+            let swapped_bytes = indexed_mapping_swap_bytes(&mapping);
+            eprintln!("owned VMA Swap after PAGEOUT: {} bytes", swapped_bytes);
+            assert_eq!(
+                swapped_bytes, 8192,
+                "PAGEOUT did not place the owned COW payloads in swap"
+            );
+            assert!(
+                swapped.iter().all(|(_, entry)| !entry.is_present()
+                    && entry.is_swapped()
+                    && entry.is_uffd_wp()),
+                "protected COW pages did not enter swap with WP retained"
+            );
+            assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+            // SAFETY: the owner retains this page; writing zero faults it back
+            // from swap and must clear WP even though its logical value stays zero.
+            unsafe { std::ptr::write_volatile(mapping.host_address() as *mut u8, 0) };
+            assert_eq!(
+                unsafe {
+                    libc::madvise(
+                        mapping.host_address() as *mut libc::c_void,
+                        4096,
+                        libc::MADV_PAGEOUT,
+                    )
+                },
+                0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let dirty_swap =
+                indexed_page_observations(&mapping, "dirty zero COW page after explicit pageout");
+            assert!(
+                !dirty_swap[0].1.is_present()
+                    && dirty_swap[0].1.is_swapped()
+                    && !dirty_swap[0].1.is_uffd_wp(),
+                "dirty COW page did not preserve its unprotected swap state"
+            );
+            assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![1]);
+            // SAFETY: both owned COW pages remain mapped; swapped contents must
+            // survive and a read fault must not consume the next dirty epoch.
+            unsafe {
+                assert_eq!(
+                    std::ptr::read_volatile(mapping.host_address() as *const u8),
+                    0
+                );
+                assert_eq!(
+                    std::ptr::read_volatile((mapping.host_address() + 4096) as *const u8),
+                    9
+                );
+            }
+            assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+        }
+        let mut original = file.try_clone().unwrap();
+        original.rewind().unwrap();
+        let mut bytes = vec![0; 8192];
+        original.read_exact(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|v| *v == 7));
+        *backend_state().lock().unwrap() = None;
     }
 }

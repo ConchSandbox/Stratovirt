@@ -161,8 +161,93 @@ impl VmConfig {
         Ok(())
     }
 
+    /// Check indexed RAM independently of pmem file objects.
+    pub fn check_indexed_memory(&self) -> Result<()> {
+        let mem = &self.machine_config.mem_config;
+        if mem.mem_map.is_none() && mem.mem_map_sources.is_none() {
+            return Ok(());
+        }
+        let (Some(index), Some(sources)) = (&mem.mem_map, &mem.mem_map_sources) else {
+            bail!("mem-map and mem-map-sources must be supplied together");
+        };
+        if !std::path::Path::new(index).is_absolute()
+            || !std::path::Path::new(sources).is_absolute()
+        {
+            bail!("indexed RAM paths must be absolute");
+        }
+        let incoming = self
+            .incoming
+            .as_ref()
+            .context("indexed RAM requires incoming")?;
+        if incoming.mode != MigrateMode::File
+            || incoming.memory != SnapshotMemoryMode::External
+            || !incoming.mapped
+            || incoming.uffd_sock.is_some()
+        {
+            bail!("indexed RAM requires external mapped file restore");
+        }
+        if mem.mem_share
+            || mem.mem_prealloc
+            || mem.mem_path.is_some()
+            || mem.hugepages != HugePageConfig::None
+        {
+            bail!("indexed RAM conflicts with shared, preallocated, alternate file, or HugeTLB memory");
+        }
+        for (kind, raw) in &self.numa_nodes {
+            if kind != "node" {
+                continue;
+            }
+            let node = parse_numa_mem(raw)?;
+            let object = self
+                .object
+                .mem_object
+                .get(&node.mem_dev)
+                .context("indexed NUMA backend is missing")?;
+            if object.share() || object.prealloc || object.mem_path.is_some() || object.memfd() {
+                bail!(
+                    "indexed RAM backend {} has an incompatible source or sharing policy",
+                    object.id
+                );
+            }
+        }
+        if !self.netdevs.is_empty() {
+            bail!("network backends are not supported with indexed RAM");
+        }
+        for (kind, args) in &self.devices {
+            if kind.starts_with("virtio-pmem-") {
+                let memdev = args
+                    .split(',')
+                    .find_map(|part| part.strip_prefix("memdev="))
+                    .context("pmem lacks memdev")?;
+                let object = self
+                    .object
+                    .mem_object
+                    .get(memdev)
+                    .context("pmem backend is missing")?;
+                if object.share()
+                    || object.mem_type != "memory-backend-file"
+                    || object.mem_path.is_none()
+                {
+                    bail!("indexed restore pmem requires a private read-only file backend");
+                }
+            }
+            if !matches!(
+                kind.as_str(),
+                "virtio-blk-device"
+                    | "virtio-blk-pci"
+                    | "virtio-pmem-device"
+                    | "virtio-pmem-pci"
+                    | "vhost-vsock-device"
+            ) {
+                bail!("device {} is not validated for indexed private RAM", kind);
+            }
+        }
+        Ok(())
+    }
+
     /// Healthy check for `VmConfig`
     pub fn check_vmconfig(&self, is_daemonize: bool) -> Result<()> {
+        self.check_indexed_memory()?;
         self.boot_source.check()?;
         self.machine_config.check()?;
         let vhost_net = self.netdevs.values().any(|n| n.netdev_type == "vhost-user");

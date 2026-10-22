@@ -139,7 +139,7 @@ use machine_manager::config::{VirtioSerialInfo, VirtioSerialPortCfg};
 use machine_manager::event_loop::EventLoop;
 use machine_manager::machine::{HypervisorType, MachineInterface, MachineLifecycle, VmState};
 use machine_manager::mmds::{parse_ipv4, MmdsConfig, MmdsData, MmdsStore, MmdsVersion};
-use machine_manager::notifier::pause_notify;
+use machine_manager::notifier::{pause_notify, set_vm_quiescent, vm_quiescent};
 use machine_manager::qmp::{qmp_response::Response, qmp_schema};
 use migration::protocol::FileFormat;
 use migration::snapshot::MEMORY_PATH_SUFFIX;
@@ -547,8 +547,25 @@ pub(crate) fn build_mem_mappings(machine_ram: &Region) -> Result<qmp_schema::Mem
             .with_context(|| format!("RAM region {} has no host address", region.name))?;
         let size = region.size();
         let page_size = region_page_size(&region);
+        if region.name == "index.json"
+            || region.name.is_empty()
+            || !region.name.as_bytes()[0].is_ascii_alphanumeric()
+            || !region
+                .name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+            || mappings
+                .iter()
+                .any(|mapping: &qmp_schema::MemMapping| mapping.id == region.name)
+        {
+            bail!(
+                "Invalid or duplicated logical RAM backend ID {:?}",
+                region.name
+            );
+        }
 
         mappings.push(qmp_schema::MemMapping {
+            id: region.name.clone(),
             base_host_virt_addr,
             size,
             offset: next_offset,
@@ -906,13 +923,41 @@ pub trait MachineOps: MachineLifecycle {
             File::open(&snapshot_path).with_context(|| "Failed to open memory snapshot file")?;
         let memory_header = MigrationManager::restore_header(&mut memory_file)?;
         memory_header.check_header()?;
-        if memory_header.format != FileFormat::MemoryFull {
-            bail!("Invalid memory snapshot file");
+        if let Some(index_path) = &mem_config.mem_map {
+            if memory_header.format != FileFormat::MemoryExternal {
+                bail!("Indexed RAM requires an EXTERNAL native memory file");
+            }
+            let sources_path = mem_config
+                .mem_map_sources
+                .as_ref()
+                .context("Missing indexed RAM source bindings")?;
+            let indexed = address_space::indexed_memory::load_indexed_memory(
+                std::path::Path::new(index_path),
+                std::path::Path::new(sources_path),
+            )?;
+            sys_mem
+                .build_indexed_ram_from_snapshot(&mut memory_file, &indexed)
+                .context("Failed to build indexed RAM and early dirty tracking")?;
+            if let Some(backends) = &mem_config.membackend_objs {
+                for region in self.get_vm_ram().subregions() {
+                    if let Some(config) = backends.iter().find(|backend| backend.id == region.name)
+                    {
+                        let mapping = region
+                            .mem_mapping
+                            .as_ref()
+                            .context("Indexed RAM backend has no host mapping")?;
+                        address_space::set_host_memory_policy(mapping, config)?;
+                    }
+                }
+            }
+        } else {
+            if memory_header.format != FileFormat::MemoryFull {
+                bail!("Invalid memory snapshot file");
+            }
+            sys_mem
+                .build_mapped_ram_from_snapshot(&mut memory_file)
+                .context("Failed to restore mapped guest memory layout")?;
         }
-
-        sys_mem
-            .build_mapped_ram_from_snapshot(&mut memory_file)
-            .with_context(|| "Failed to restore mapped guest memory layout")?;
         let expected_ram_states = self.expected_ram_region_states(mem_config)?;
         let expected_alias_states = self.expected_alias_region_states(mem_config);
         sys_mem
@@ -953,6 +998,12 @@ pub trait MachineOps: MachineLifecycle {
     ) -> Result<()> {
         trace::trace_scope_start!(init_memory);
         let migrate_info = self.get_migrate_info();
+        if migrate_info.mode == MigrateMode::File {
+            // Devices restored after RAM construction must remain frozen until
+            // vm_start/cont; early RAM writes still enter indexed tracking.
+            pause_notify(true);
+            set_vm_quiescent(false);
+        }
         if migrate_info.mode == MigrateMode::File && migrate_info.mapped {
             self.restore_mapped_ram(sys_mem, mem_config)?;
         } else {
@@ -3267,6 +3318,12 @@ pub trait MachineOps: MachineLifecycle {
         if !paused {
             EventLoop::get_ctx(None).unwrap().enable_clock();
             self.active_drive_files()?;
+            pause_notify(false);
+            MigrationManager::quiesce_devices(false)?;
+        } else {
+            pause_notify(true);
+            // Startup pause is not yet a runtime capture interval.
+            set_vm_quiescent(false);
         }
 
         let cpus = &self.machine_base().cpus;
@@ -3304,6 +3361,7 @@ pub trait MachineOps: MachineLifecycle {
     ///
     /// * `vm_state` - Vm state.
     fn vm_pause(&self, vm_state: &mut VmState) -> Result<()> {
+        set_vm_quiescent(false);
         EventLoop::get_ctx(None).unwrap().disable_clock();
 
         // Deactive files so that VM on the other end can active files.
@@ -3333,10 +3391,13 @@ pub trait MachineOps: MachineLifecycle {
             irq_chip.as_ref().unwrap().stop();
         }
 
-        *vm_state = VmState::Paused;
-
-        // Notify VM paused.
+        // Hold queue gates throughout native save and host RAM export. The
+        // migration state can independently become Completed during this time.
         pause_notify(true);
+        MigrationManager::quiesce_devices(true)
+            .context("Failed to quiesce devices and flush block backends")?;
+        set_vm_quiescent(true);
+        *vm_state = VmState::Paused;
 
         Ok(())
     }
@@ -3346,12 +3407,17 @@ pub trait MachineOps: MachineLifecycle {
     /// # Arguments
     ///
     /// * `vm_state` - Vm state.
-    /// * `full_resume` - Whether this is a normal Paused-to-Running resume:
-    ///   notify devices that the VM resumed and, on failure, roll back to the
-    ///   paused state. The Running-to-Running recovery path passes `false`
-    ///   and skips both, because devices were never told the VM was paused
-    ///   and there is no paused state to go back to on failure.
+    /// * `full_resume` - Whether the source is a confirmed Paused state. When
+    ///   true, drive-activation, device or vCPU failure also attempts to restore
+    ///   the paused clock/drive state. Running-to-Running recovery passes false:
+    ///   an incomplete pause may already have parked vCPUs and closed device gates.
+    ///   Both paths notify listeners and reactivate devices before resuming vCPUs.
+    ///   Device-reactivation failure always attempts to close the gates again and
+    ///   disables the clock, regardless of the source state.
     fn vm_resume(&self, vm_state: &mut VmState, full_resume: bool) -> Result<()> {
+        if MigrationManager::snapshot_writers_active() {
+            bail!("Native snapshot writers are still active");
+        }
         EventLoop::get_ctx(None).unwrap().enable_clock();
 
         if let Err(e) = self.active_drive_files() {
@@ -3363,6 +3429,25 @@ pub trait MachineOps: MachineLifecycle {
             return Err(e);
         }
 
+        pause_notify(false);
+        if let Err(err) = MigrationManager::quiesce_devices(false) {
+            pause_notify(true);
+            let mut failure = err;
+            if let Err(rollback) = MigrationManager::quiesce_devices(true) {
+                failure = failure.context(format!(
+                    "Failed to restore device quiescence: {rollback:#}"
+                ));
+            }
+            if full_resume {
+                if let Err(rollback) = self.deactive_drive_files() {
+                    failure = failure.context(format!(
+                        "Failed to deactivate drive files during resume rollback: {rollback:#}"
+                    ));
+                }
+            }
+            EventLoop::get_ctx(None).unwrap().disable_clock();
+            return Err(failure);
+        }
         let cpus = &self.machine_base().cpus;
         for (cpu_index, cpu) in cpus.iter().enumerate() {
             if let Err(e) = cpu.resume() {
@@ -3375,11 +3460,6 @@ pub trait MachineOps: MachineLifecycle {
         }
 
         *vm_state = VmState::Running;
-
-        if full_resume {
-            // Notify VM resumed.
-            pause_notify(false);
-        }
 
         Ok(())
     }
@@ -3410,6 +3490,9 @@ pub trait MachineOps: MachineLifecycle {
         use VmState::*;
 
         let mut vm_state = self.get_vm_state().lock().unwrap();
+        if new_state == Running && MigrationManager::snapshot_writers_active() {
+            bail!("Cannot resume while native snapshot writers are active");
+        }
         if MigrationManager::is_active() {
             *vm_state = new_state;
             return Ok(());
@@ -3430,12 +3513,12 @@ pub trait MachineOps: MachineLifecycle {
             (Running, Paused) | (Created, Paused) => self
                 .vm_pause(&mut vm_state)
                 .with_context(|| "Failed to pause vm.")?,
-            (Paused, Paused) => return Ok(()),
-            // A failed pause may have left vCPUs parked in Paused while the
-            // VM state is still Running; restore them and re-enable the
-            // virtual clock (no-op when already Running). Devices are not
-            // notified and failure rollback is skipped: they were never told
-            // the VM was paused, so there is no paused state to go back to.
+            (Paused, Paused) if vm_quiescent() => return Ok(()),
+            (Paused, Paused) => self.vm_pause(&mut vm_state)?,
+            // A failed pause may leave vCPUs parked or device gates closed
+            // while the coarse VM state remains Running. Recover both through
+            // the common resume path; there is no confirmed Paused source state
+            // for the additional clock/drive rollback on vCPU-resume failure.
             (Running, Running) => self
                 .vm_resume(&mut vm_state, false)
                 .with_context(|| "Failed to restore vCPUs after failed pause.")?,
@@ -3532,10 +3615,22 @@ fn start_incoming_migration(
     freeze_cpu: bool,
 ) -> Result<()> {
     let migrate_info = vm.lock().unwrap().get_migrate_info();
+    let indexed = vm
+        .lock()
+        .unwrap()
+        .get_vm_config()
+        .lock()
+        .unwrap()
+        .machine_config
+        .mem_config
+        .mem_map
+        .is_some();
     let path = migrate_info.uri;
     match migrate_info.mode {
         MigrateMode::File => {
-            let restore_mode = if let Some(uffd_sock) = migrate_info.uffd_sock.as_ref() {
+            let restore_mode = if indexed {
+                RestoreMode::Indexed
+            } else if let Some(uffd_sock) = migrate_info.uffd_sock.as_ref() {
                 RestoreMode::Uffd {
                     socket_path: uffd_sock.clone(),
                     memory: migrate_info.memory,
@@ -3741,6 +3836,204 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_device_resume_restores_drive_locks_and_preserves_errors() {
+        const CHILD: &str = "CONCH_TEST_RESUME_ROLLBACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::failed_device_resume_restores_drive_locks_and_preserves_errors",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated resume rollback regression failed");
+            return;
+        }
+        use migration::{DeviceStateDesc, MigrationHook, StateTransfer};
+        use vmm_sys_util::tempfile::TempFile;
+
+        struct FailedDevice {
+            files: Arc<Mutex<HashMap<String, DriveFile>>>,
+            calls: Arc<Mutex<Vec<bool>>>,
+            rollback_fails: bool,
+        }
+        impl StateTransfer for FailedDevice {
+            fn get_state_vec(&self) -> Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            fn get_device_alias(&self) -> u64 {
+                0
+            }
+        }
+        impl MigrationHook for FailedDevice {
+            fn quiesce(&self, paused: bool) -> Result<()> {
+                self.calls.lock().unwrap().push(paused);
+                if !paused {
+                    assert!(self.files.lock().unwrap()["test-drive"].locked);
+                    bail!("injected device resume error");
+                }
+                if self.rollback_fails {
+                    bail!("injected device rollback error");
+                }
+                Ok(())
+            }
+        }
+
+        // The global migration/device registries and clock live only in this
+        // child. The machine uses real file locks and the Test hypervisor.
+        EventLoop::object_init(&None).unwrap();
+        let mut config = VmConfig::default();
+        config.machine_config.hypervisor = HypervisorType::Test;
+        let machine = LightMachine::new(&config).unwrap();
+        let files = machine.get_drive_files();
+        files.lock().unwrap().insert(
+            "test-drive".to_owned(),
+            DriveFile {
+                id: "test-drive".to_owned(),
+                file: Arc::new(TempFile::new().unwrap().into_file()),
+                count: 1,
+                path: "test-drive".to_owned(),
+                read_only: false,
+                locked: false,
+                req_align: 1,
+                buf_align: 1,
+            },
+        );
+        let desc = DeviceStateDesc {
+            name: "ConchFailedResumeTest".to_owned(),
+            alias: 0,
+            size: 0,
+            current_version: 1,
+            compat_version: 1,
+            fields: Vec::new(),
+        };
+        for full_resume in [true, false] {
+            for rollback_fails in [false, true] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                MigrationManager::register_device_instance(
+                    desc.clone(),
+                    Arc::new(Mutex::new(FailedDevice {
+                        files: files.clone(),
+                        calls: calls.clone(),
+                        rollback_fails,
+                    })),
+                    "device",
+                );
+                pause_notify(true);
+                set_vm_quiescent(true);
+                let original = if full_resume {
+                    VmState::Paused
+                } else {
+                    VmState::Running
+                };
+                let mut state = original;
+                let error = machine.vm_resume(&mut state, full_resume).unwrap_err();
+                assert_eq!(state, original, "failed resume committed a new state");
+                assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+                assert_eq!(
+                    files.lock().unwrap()["test-drive"].locked,
+                    !full_resume,
+                    "confirmed-pause recovery must deactivate drives"
+                );
+                assert!(!vm_quiescent(), "failed resume must not certify a barrier");
+                let message = format!("{error:#}");
+                assert!(message.contains("injected device resume error"), "{message}");
+                if rollback_fails {
+                    assert!(
+                        message.contains("injected device rollback error"),
+                        "{message}"
+                    );
+                }
+                machine.deactive_drive_files().unwrap();
+                MigrationManager::unregister_device_instance(desc.clone(), "device");
+            }
+        }
+    }
+
+    #[test]
+    fn capture_resume_notifies_once_and_retains_timer_ownership() {
+        const CHILD: &str = "CONCH_TEST_RESUME_NOTIFY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::capture_resume_notifies_once_and_retains_timer_ownership",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated resume-notifier regression failed"
+            );
+            return;
+        }
+        use machine_manager::notifier::{
+            register_vm_pause_notifier, unregister_vm_pause_notifier, vm_paused,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Isolate process-global notifier, migration and event-loop registries
+        // from other machine tests. No KVM device or architecture guest is needed.
+        EventLoop::object_init(&None).unwrap();
+        let mut config = VmConfig::default();
+        config.machine_config.hypervisor = HypervisorType::Test;
+        let machine = LightMachine::new(&config).unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let timer_id = Arc::new(Mutex::new(None));
+        let count = notifications.clone();
+        let owned_timer = timer_id.clone();
+        let notifier = register_vm_pause_notifier(Arc::new(move |paused| {
+            let context = EventLoop::get_ctx(None).unwrap();
+            let mut owned = owned_timer.lock().unwrap();
+            if paused {
+                if let Some(id) = owned.take() {
+                    context.timer_del(id);
+                }
+            } else {
+                assert!(
+                    !vm_paused(),
+                    "global gate must open before resume callbacks"
+                );
+                count.fetch_add(1, Ordering::SeqCst);
+                // Match the existing ACPI PowerDev ownership pattern: resume
+                // stores the new timer ID, and pause removes that one timer.
+                *owned = Some(context.timer_add(Box::new(|| {}), Duration::from_secs(60)));
+            }
+        }));
+        for full_resume in [true, false] {
+            pause_notify(true);
+            notifications.store(0, Ordering::SeqCst);
+            let mut state = if full_resume {
+                VmState::Paused
+            } else {
+                VmState::Running
+            };
+            machine.vm_resume(&mut state, full_resume).unwrap();
+            assert_eq!(state, VmState::Running);
+            let received = notifications.load(Ordering::SeqCst);
+            assert!(EventLoop::get_ctx(None)
+                .unwrap()
+                .timers_min_duration()
+                .is_some());
+            pause_notify(true);
+            assert!(
+                EventLoop::get_ctx(None)
+                    .unwrap()
+                    .timers_min_duration()
+                    .is_none(),
+                "pause left an unowned timer after {received} resume notifications"
+            );
+            assert_eq!(received, 1, "one resume must notify each listener once");
+        }
+        unregister_vm_pause_notifier(notifier);
+    }
+
+    #[test]
     fn test_numa_memdev_selects_backend_without_host_nodes() {
         const MEM_SIZE: u64 = 2 * 1024 * 1024;
 
@@ -3792,6 +4085,8 @@ mod tests {
         let mappings = build_mem_mappings(&root).unwrap();
 
         assert_eq!(mappings.mappings.len(), 2);
+        assert_eq!(mappings.mappings[0].id, "low");
+        assert_eq!(mappings.mappings[1].id, "high");
         assert_eq!(mappings.mappings[0].base_host_virt_addr, low.host_address());
         assert_eq!(mappings.mappings[0].size, 0x2000);
         assert_eq!(mappings.mappings[0].offset, 0);
@@ -3801,6 +4096,17 @@ mod tests {
         );
         assert_eq!(mappings.mappings[1].size, 0x1000);
         assert_eq!(mappings.mappings[1].offset, 0x2000);
+    }
+
+    #[test]
+    fn capture_memory_mapping_rejects_reserved_backend_name() {
+        let root = Region::init_container_region(0x1000, "root");
+        let mapping = Arc::new(
+            HostMemMapping::new(GuestAddress(0), None, 0x1000, None, false, false, false).unwrap(),
+        );
+        root.add_subregion_not_update(Region::init_ram_region(mapping, "index.json"), 0)
+            .unwrap();
+        assert!(build_mem_mappings(&root).is_err());
     }
 
     #[test]

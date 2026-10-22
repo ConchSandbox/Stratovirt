@@ -2087,6 +2087,15 @@ impl<T: Clone + Send + Sync> BlockDriverOps<T> for Qcow2Driver<T> {
         self.driver.flush_request()
     }
 
+    fn quiesce(&mut self) -> Result<()> {
+        self.driver.quiesce()?;
+        self.flush()?;
+        self.driver
+            .file
+            .sync_all()
+            .context("Failed to flush qcow2 snapshot backing")
+    }
+
     fn resize(&mut self, new_size: u64) -> Result<()> {
         if !is_aligned(SECTOR_SIZE, new_size) {
             bail!(

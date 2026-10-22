@@ -1459,6 +1459,10 @@ $ ./stratovirt \
 
 See [Snapshot and Restore](./snapshot.md) for details.
 
+The paired `-mem-map` and `-mem-map-sources` arguments add Conch indexed
+EXTERNAL RAM restore. See [Conch indexed RAM snapshots](./conch-indexed.md)
+for input formats, configuration conflicts and supported devices.
+
 ## 6. Ozone
 Ozone is a lightweight secure sandbox for StratoVirt, it provides secure environment for StratoVirt
 by limiting resources of StratoVirt using 'namespace'. Please run ozone with root permission.

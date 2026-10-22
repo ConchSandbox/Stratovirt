@@ -149,6 +149,10 @@ impl<T: Clone + Send + Sync> BlockDriverOps<T> for RawDriver<T> {
         self.driver.flush_request()
     }
 
+    fn quiesce(&mut self) -> Result<()> {
+        self.driver.quiesce()
+    }
+
     fn resize(&mut self, new_size: u64) -> Result<()> {
         if !is_aligned(SECTOR_SIZE, new_size) {
             bail!(

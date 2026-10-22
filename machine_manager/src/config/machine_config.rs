@@ -184,6 +184,10 @@ impl FromStr for HugePageConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MachineMemConfig {
     #[serde(default)]
+    pub mem_map: Option<String>,
+    #[serde(default)]
+    pub mem_map_sources: Option<String>,
+    #[serde(default)]
     pub hugepages: HugePageConfig,
     pub mem_size: u64,
     pub max_size: u64,
@@ -198,6 +202,8 @@ pub struct MachineMemConfig {
 impl Default for MachineMemConfig {
     fn default() -> Self {
         MachineMemConfig {
+            mem_map: None,
+            mem_map_sources: None,
             hugepages: HugePageConfig::None,
             mem_size: DEFAULT_MEMSIZE * M,
             max_size: DEFAULT_MEMSIZE * M,
@@ -714,7 +720,9 @@ impl VmConfig {
         let mb_config =
             MemBackendObjConfig::try_parse_from(str_slip_to_clap(mem_backend, true, false))?;
 
-        if (mb_config.mem_path.is_none() && mb_config.mem_type.eq("memory-backend-file"))
+        if (mb_config.mem_path.is_none()
+            && mb_config.mem_type.eq("memory-backend-file")
+            && self.machine_config.mem_config.mem_map.is_none())
             || (mb_config.mem_path.is_some() && mb_config.mem_type.ne("memory-backend-file"))
         {
             bail!("Object type: {} config path err", mb_config.mem_type);
@@ -837,6 +845,8 @@ mod tests {
     #[test]
     fn test_health_check() {
         let memory_config = MachineMemConfig {
+            mem_map: None,
+            mem_map_sources: None,
             hugepages: HugePageConfig::None,
             mem_size: MIN_MEMSIZE,
             mem_path: None,

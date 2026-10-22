@@ -389,7 +389,7 @@ pub fn create_backend_mem(
 ///
 /// * `mem_mappings` - The host virtual address of mapped memory information.
 /// * `mb_config` - Memory backend config info.
-fn set_host_memory_policy(
+pub fn set_host_memory_policy(
     mem_mappings: &Arc<HostMemMapping>,
     mb_config: &MemBackendObjConfig,
 ) -> Result<()> {
@@ -442,6 +442,8 @@ pub struct HostMemMapping {
     host_addr: *mut u8,
     /// Represents file and offset-in-file that backs this mapping.
     file_back: Option<FileBackend>,
+    /// Composite file mappings have no single exportable backing descriptor.
+    indexed: bool,
     /// share mem flag
     is_share: bool,
     /// The size of a memory page in bytes.
@@ -456,6 +458,92 @@ unsafe impl Send for HostMemMapping {}
 unsafe impl Sync for HostMemMapping {}
 
 impl HostMemMapping {
+    /// Reserve one continuous HVA and replace only owned subranges with private
+    /// mappings. The returned owner releases all fragments with one munmap.
+    pub fn from_indexed_backend(
+        backend: &crate::indexed_memory::MemoryBackendIndex,
+        sources: &crate::indexed_memory::SourceBindings,
+    ) -> Result<Self> {
+        use crate::indexed_memory::{
+            extent_file_range, open_source_file, validate_backend, INDEX_PAGE_SIZE,
+        };
+        use std::os::fd::AsRawFd;
+        validate_backend(backend)?;
+        if host_page_size() != INDEX_PAGE_SIZE {
+            bail!("indexed RAM requires 4096-byte host pages");
+        }
+        let length = usize::try_from(backend.size_bytes)?;
+        // SAFETY: anonymous PROT_NONE reserves an unused address range.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error()).context("reserve indexed RAM");
+        }
+        struct Reservation(*mut libc::c_void, usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                // SAFETY: this owner holds the complete reservation, including replaced fragments.
+                unsafe { libc::munmap(self.0, self.1) };
+            }
+        }
+        let reservation = Reservation(base, length);
+        let mut files = std::collections::HashMap::new();
+        for extent in &backend.extents {
+            let key = (&extent.source_layer, &extent.source_file);
+            if !files.contains_key(&key) {
+                files.insert(
+                    key,
+                    open_source_file(sources, &extent.source_layer, &extent.source_file)?,
+                );
+            }
+            let file = &files[&key];
+            let (a, b) = extent_file_range(backend, extent)?;
+            if file.metadata()?.len() != b - a {
+                bail!("RAM source length changed: {}", extent.source_file);
+            }
+            // SAFETY: validated extents exactly partition this owned reservation.
+            // MAP_PRIVATE preserves source bytes and captures later writes as COW.
+            let mapped = unsafe {
+                libc::mmap(
+                    (base as *mut u8).add(usize::try_from(extent.start)?) as *mut libc::c_void,
+                    usize::try_from(extent.end - extent.start)?,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    file.as_raw_fd(),
+                    i64::try_from(extent.file_offset)?,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "map RAM {}:[{}, {}) from {}",
+                        backend.id, extent.start, extent.end, extent.source_file
+                    )
+                });
+            }
+        }
+        let mut mapping = Self::new(
+            GuestAddress(0),
+            Some(base as u64),
+            backend.size_bytes,
+            None,
+            false,
+            false,
+            false,
+        )?;
+        mapping.indexed = true;
+        std::mem::forget(reservation);
+        Ok(mapping)
+    }
+
     /// Construct a new HostMemMapping.
     ///
     /// # Arguments
@@ -541,8 +629,13 @@ impl HostMemMapping {
             host_addr: host_addr as *mut u8,
             page_size,
             file_back,
+            indexed: false,
             is_share,
         })
+    }
+
+    pub fn is_indexed(&self) -> bool {
+        self.indexed
     }
 
     pub fn page_size(&self) -> u64 {
@@ -566,7 +659,8 @@ impl HostMemMapping {
     }
 
     /// Get File backend information if this mapping is backed be host-memory.
-    /// return None if this mapping is an anonymous mapping.
+    /// Return None for anonymous or indexed mappings. Indexed RAM intentionally
+    /// has no descriptor that could represent the complete composite backend.
     pub fn file_backend(&self) -> Option<FileBackend> {
         self.file_back.clone()
     }

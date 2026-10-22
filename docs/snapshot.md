@@ -2,6 +2,10 @@
 
 StratoVirt supports to take a snapshot of a paused VM as VM template. This template can be used to warm start a new VM. Warm start skips the kernel boot stage and userspace initialization stage to boot VM in a very short time.
 
+For Conch cumulative RAM indexes, private file mappings and EXTERNAL native
+state, see [Conch indexed RAM snapshots](./conch-indexed.md). That mode has
+additional layout, dirty-tracking and device-quiescence requirements.
+
 ## Create VM template
 
 First, we create a StratoVirt VM:

@@ -381,6 +381,10 @@ pub trait BlockDriverOps<T: Clone>: Send {
 
     fn flush_request(&mut self) -> Result<()>;
 
+    /// Complete outstanding callbacks and make the backing data durable.
+    /// Queue submission must already be disabled by the device owner.
+    fn quiesce(&mut self) -> Result<()>;
+
     fn resize(&mut self, new_size: u64) -> Result<()>;
 
     fn get_inflight(&self) -> Arc<AtomicU64>;

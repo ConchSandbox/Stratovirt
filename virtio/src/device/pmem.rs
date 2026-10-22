@@ -34,12 +34,13 @@ use machine_manager::config::{
     MEM_BACKEND_TYPE_FILE,
 };
 use machine_manager::event_loop::{register_event_helper, unregister_event_helper, EventLoop};
+use machine_manager::notifier::vm_paused;
 use migration::{
     DeviceStateDesc, MigrationError, MigrationHook, MigrationManager, MigrationStatus,
     StateTransfer,
 };
 use migration_derive::DescSerde;
-use util::aio::{wait_io_done, IoRef, DEFAULT_IO_TIMEOUT};
+use util::aio::{wait_io_done_checked, IoRef, DEFAULT_IO_TIMEOUT};
 use util::byte_code::ByteCode;
 use util::gen_base_func;
 use util::loop_context::{
@@ -240,7 +241,7 @@ impl Pmem {
             mem_space: None,
             mem_region: None,
             interrupt_cb: None,
-            migrating: Arc::new(AtomicBool::new(false)),
+            migrating: Arc::new(AtomicBool::new(vm_paused())),
             io_inflight: IoRef::default(),
             queue_evts: Arc::new(Mutex::new(Vec::new())),
             iothread: config.iothread.clone(),
@@ -415,6 +416,9 @@ impl StateTransfer for Pmem {
     fn set_state_mut(&mut self, state: &[u8], _version: u32) -> Result<()> {
         let state: PmemState = serde_json::from_slice(state)
             .with_context(|| MigrationError::FromBytesError("Pmem"))?;
+        if state.config.start != self.config.start || state.config._size != self.config._size {
+            bail!("Snapshot pmem layout differs from device {}", self.id);
+        }
         self.base.device_features = state.device_features;
         self.base.driver_features = state.driver_features;
         self.base.broken.store(state.broken, Ordering::SeqCst);
@@ -428,6 +432,18 @@ impl StateTransfer for Pmem {
 }
 
 impl MigrationHook for Pmem {
+    fn quiesce(&self, paused: bool) -> Result<()> {
+        self.migrating.store(paused, Ordering::SeqCst);
+        if paused {
+            wait_io_done_checked(&self.io_inflight, DEFAULT_IO_TIMEOUT, &self.id)?;
+        } else {
+            for evt in self.queue_evts.lock().unwrap().iter() {
+                evt.write(1).context("Failed to resume pmem queue")?;
+            }
+        }
+        Ok(())
+    }
+
     fn resume(&mut self) -> Result<()> {
         let locked_evts = self.queue_evts.lock().unwrap();
         for evt in locked_evts.iter() {
@@ -442,14 +458,15 @@ impl MigrationHook for Pmem {
         if save {
             match status {
                 MigrationStatus::Active => {
-                    self.migrating.store(true, Ordering::SeqCst);
                     info!("Drain the request for virtio-pmem@{}", self.id);
-                    wait_io_done(&self.io_inflight, DEFAULT_IO_TIMEOUT, &self.id);
+                    self.quiesce(true)?;
                 }
                 MigrationStatus::Completed
                 | MigrationStatus::Failed
                 | MigrationStatus::Canceled => {
-                    self.migrating.store(false, Ordering::SeqCst);
+                    if !vm_paused() {
+                        self.quiesce(false)?;
+                    }
                 }
                 _ => {}
             }
@@ -463,6 +480,34 @@ mod tests {
     use clap::Parser;
     use machine_manager::config::str_slip_to_clap;
     use vmm_sys_util::tempfile::TempFile;
+
+    #[test]
+    fn capture_pause_survives_snapshot_completion() {
+        let pmem = Pmem::default();
+        machine_manager::notifier::pause_notify(true);
+        pmem.quiesce(true).unwrap();
+        pmem.notify_status(true, MigrationStatus::Completed)
+            .unwrap();
+        assert!(pmem.migrating.load(Ordering::SeqCst));
+        machine_manager::notifier::pause_notify(false);
+        pmem.quiesce(false).unwrap();
+        assert!(!pmem.migrating.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_pmem_restore_rejects_changed_layout() {
+        let mut pmem = Pmem::default();
+        let mut state: PmemState = serde_json::from_slice(&pmem.get_state_vec().unwrap()).unwrap();
+        state.config._size = VIRTIO_PMEM_BLOCK_SIZE;
+        assert!(pmem
+            .set_state_mut(&serde_json::to_vec(&state).unwrap(), 0)
+            .is_err());
+        state.config._size = 0;
+        state.config.start = VIRTIO_PMEM_BLOCK_SIZE;
+        assert!(pmem
+            .set_state_mut(&serde_json::to_vec(&state).unwrap(), 0)
+            .is_err());
+    }
 
     use super::*;
 

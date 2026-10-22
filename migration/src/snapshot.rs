@@ -15,11 +15,9 @@ use std::fs::{create_dir, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::error;
 use machine_manager::config::SnapshotMemoryMode;
 
 use crate::general::{translate_id, Lifecycle};
@@ -49,6 +47,8 @@ const DEVICE_PATH_SUFFIX: &str = "state";
 pub enum RestoreMode {
     /// Directly mmap the memory snapshot file as the RAM backend.
     Mapped,
+    /// Guest RAM is already established from a validated cumulative index.
+    Indexed,
     /// Read/copy memory from the snapshot file into pre-allocated RAM.
     Copy,
     /// Guest RAM pages are served on demand by the external uffd daemon
@@ -58,6 +58,33 @@ pub enum RestoreMode {
         socket_path: String,
         memory: SnapshotMemoryMode,
     },
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn capture_native_failure_waits_for_auxiliary_writer() {
+        let ended = Arc::new(AtomicBool::new(false));
+        let worker_ended = ended.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            worker_ended.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let result = join_snapshot_worker(Err(anyhow!("main writer failed")), writer);
+        assert!(result.is_err());
+        assert!(ended.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_native_worker_failure_is_not_reported_complete() {
+        let writer = thread::spawn(|| Err(anyhow!("auxiliary writer failed")));
+        assert!(join_snapshot_worker(Ok(()), writer).is_err());
+    }
 }
 
 fn memory_file_format(memory: SnapshotMemoryMode) -> Result<FileFormat> {
@@ -75,7 +102,53 @@ fn memory_mode_from_format(format: FileFormat) -> Result<SnapshotMemoryMode> {
     }
 }
 
+static SNAPSHOT_WRITERS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct SnapshotWriterGuard;
+impl SnapshotWriterGuard {
+    fn acquire() -> Result<Self> {
+        if SNAPSHOT_WRITERS_ACTIVE.swap(true, Ordering::SeqCst) {
+            bail!("A native snapshot operation is already active");
+        }
+        Ok(Self)
+    }
+}
+impl Drop for SnapshotWriterGuard {
+    fn drop(&mut self) {
+        SNAPSHOT_WRITERS_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+fn join_snapshot_worker(main: Result<()>, worker: thread::JoinHandle<Result<()>>) -> Result<()> {
+    let auxiliary = worker
+        .join()
+        .map_err(|_| anyhow!("Native snapshot worker panicked"))?;
+    match (main, auxiliary) {
+        (Err(main), Err(auxiliary)) => {
+            Err(main.context(format!("Auxiliary snapshot failure: {auxiliary:#}")))
+        }
+        (Err(main), _) => Err(main),
+        (_, Err(auxiliary)) => Err(auxiliary),
+        _ => Ok(()),
+    }
+}
+
 impl MigrationManager {
+    pub fn snapshot_writers_active() -> bool {
+        SNAPSHOT_WRITERS_ACTIVE.load(Ordering::SeqCst)
+    }
+
+    /// A runtime device barrier does not change migration status.
+    pub fn quiesce_devices(paused: bool) -> Result<()> {
+        let vmm = MIGRATION_MANAGER.vmm.read().unwrap();
+        for transport in vmm.transports.values() {
+            transport.lock().unwrap().quiesce(paused)?;
+        }
+        for device in vmm.devices.values() {
+            device.lock().unwrap().quiesce(paused)?;
+        }
+        Ok(())
+    }
     /// Save snapshot for `VM`.
     ///
     /// # Notes
@@ -88,6 +161,10 @@ impl MigrationManager {
     ///
     /// * `path` - snapshot dir path. If path dir not exists, will create it.
     pub fn save_snapshot(path: &str, memory: SnapshotMemoryMode) -> Result<()> {
+        let _writers = SnapshotWriterGuard::acquire()?;
+        if memory == SnapshotMemoryMode::External && !machine_manager::notifier::vm_quiescent() {
+            bail!("External snapshot requires a confirmed device quiescence barrier");
+        }
         // Set status to `Active`
         MigrationManager::set_status(MigrationStatus::Active)?;
         MigrationManager::notify_status(true, MigrationStatus::Active)?;
@@ -111,36 +188,20 @@ impl MigrationManager {
             }
         }
 
-        let ret = Arc::new(AtomicBool::new(true));
-        let gpu_ret = ret.clone();
         let gpu_path = path.to_string();
         let handle = thread::Builder::new()
             .name("save-gpu".to_string())
-            .spawn(move || {
-                // Save GPU device state
-                Self::save_gpu(gpu_path.as_str()).unwrap_or_else(|e| {
-                    gpu_ret.store(false, Ordering::SeqCst);
-                    error!("Failed to save gpu state: {:?}", e);
-                });
-            })?;
-
-        // Save memory data
-        let mut vm_memory_path = PathBuf::from(path);
-        vm_memory_path.push(MEMORY_PATH_SUFFIX);
-        match File::create(vm_memory_path) {
-            Ok(mut memory_file) => {
-                Self::save_memory(&mut memory_file, memory)?;
-            }
-            Err(e) => {
-                bail!("Failed to create snapshot memory file: {}", e);
-            }
-        }
-        if handle.join().is_err() {
-            error!("Save gpu thread join failed");
-        }
-        if !ret.load(Ordering::Acquire) {
-            bail!("Failed to save gpu state");
-        }
+            .spawn(move || Self::save_gpu(&gpu_path))?;
+        let memory_result = (|| {
+            let mut vm_memory_path = PathBuf::from(path);
+            vm_memory_path.push(MEMORY_PATH_SUFFIX);
+            let mut memory_file =
+                File::create(vm_memory_path).context("Failed to create snapshot memory file")?;
+            Self::save_memory(&mut memory_file, memory)
+        })();
+        // Join even when the main writer failed. A terminal QMP result must
+        // never leave an auxiliary writer using the output directory.
+        join_snapshot_worker(memory_result, handle)?;
 
         // Set status to `Completed`
         MigrationManager::set_status(MigrationStatus::Completed)?;
@@ -161,6 +222,7 @@ impl MigrationManager {
     /// * `path` - snapshot dir path.
     /// * `mode` - how guest memory is provided (see [`RestoreMode`]).
     pub fn restore_snapshot(path: &str, mode: RestoreMode) -> Result<()> {
+        let _writers = SnapshotWriterGuard::acquire()?;
         let mut snapshot_path = PathBuf::from(path);
         if !snapshot_path.is_dir() {
             return Err(anyhow!(MigrationError::InvalidSnapshotPath));
@@ -183,6 +245,9 @@ impl MigrationManager {
             {
                 bail!("memory=external requires UFFD restore")
             }
+            RestoreMode::Indexed if snapshot_memory != SnapshotMemoryMode::External => {
+                bail!("Indexed restore requires an EXTERNAL memory snapshot")
+            }
             RestoreMode::Uffd { memory, .. } if memory != snapshot_memory => {
                 bail!("Incoming memory mode does not match snapshot memory file")
             }
@@ -198,35 +263,20 @@ impl MigrationManager {
             bail!("Invalid device state snapshot file");
         }
 
-        let ret = Arc::new(AtomicBool::new(true));
-        let gpu_ret = ret.clone();
         let gpu_path = path.to_string();
-        // GPU state must be restored in all modes, including `Uffd` where guest
-        // memory is provided lazily and `load_memory` is false.
         let handle = thread::Builder::new()
             .name("restore-gpu".to_string())
-            .spawn(move || {
-                // Restore GPU device state
-                Self::restore_gpu(gpu_path.as_str()).unwrap_or_else(|e| {
-                    gpu_ret.store(false, Ordering::SeqCst);
-                    error!("Failed to restore gpu state: {:?}", e);
-                });
-            })?;
-
-        Self::restore_memory(&mut memory_file, &mode)
-            .with_context(|| "Failed to load snapshot memory")?;
-        let snapshot_desc_db =
-            Self::restore_desc_db(&mut device_state_file, device_state_header.desc_len)
-                .with_context(|| "Failed to load device descriptor db")?;
-        Self::restore_vmstate(snapshot_desc_db, &mut device_state_file)
-            .with_context(|| "Failed to load snapshot device state")?;
-
-        if handle.join().is_err() {
-            error!("Restore gpu thread join failed");
-        }
-        if !ret.load(Ordering::Acquire) {
-            bail!("Failed to restore gpu state");
-        }
+            .spawn(move || Self::restore_gpu(&gpu_path))?;
+        let restore_result = (|| {
+            Self::restore_memory(&mut memory_file, &mode)
+                .context("Failed to load snapshot memory")?;
+            let snapshot_desc_db =
+                Self::restore_desc_db(&mut device_state_file, device_state_header.desc_len)
+                    .context("Failed to load device descriptor db")?;
+            Self::restore_vmstate(snapshot_desc_db, &mut device_state_file)
+                .context("Failed to load snapshot device state")
+        })();
+        join_snapshot_worker(restore_result, handle)?;
 
         Self::resume()?;
 

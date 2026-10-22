@@ -1303,9 +1303,11 @@ impl DeviceInterface for StdMachine {
     }
 
     fn query_mem_mappings(&self) -> Response {
-        if *self.get_vm_state().lock().unwrap() != VmState::Paused {
+        if *self.get_vm_state().lock().unwrap() != VmState::Paused
+            || !machine_manager::notifier::vm_quiescent()
+        {
             return Response::create_error_response(
-                qmp_schema::QmpErrorClass::GenericError("VM must be paused".to_string()),
+                qmp_schema::QmpErrorClass::GenericError("VM must be quiescent".to_string()),
                 None,
             );
         }
@@ -1322,9 +1324,11 @@ impl DeviceInterface for StdMachine {
     }
 
     fn query_mem_page_state(&self) -> Response {
-        if *self.get_vm_state().lock().unwrap() != VmState::Paused {
+        if *self.get_vm_state().lock().unwrap() != VmState::Paused
+            || !machine_manager::notifier::vm_quiescent()
+        {
             return Response::create_error_response(
-                qmp_schema::QmpErrorClass::GenericError("VM must be paused".to_string()),
+                qmp_schema::QmpErrorClass::GenericError("VM must be quiescent".to_string()),
                 None,
             );
         }
@@ -1339,9 +1343,11 @@ impl DeviceInterface for StdMachine {
     }
 
     fn query_mem_dirty_bitmap(&self) -> Response {
-        if *self.get_vm_state().lock().unwrap() != VmState::Paused {
+        if *self.get_vm_state().lock().unwrap() != VmState::Paused
+            || !machine_manager::notifier::vm_quiescent()
+        {
             return Response::create_error_response(
-                qmp_schema::QmpErrorClass::GenericError("VM must be paused".to_string()),
+                qmp_schema::QmpErrorClass::GenericError("VM must be quiescent".to_string()),
                 None,
             );
         }

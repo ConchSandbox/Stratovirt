@@ -49,6 +49,18 @@ pub(crate) static MIGRATION_MANAGER: Lazy<MigrationManager> = Lazy::new(|| Migra
 /// This trait is a symbol of device's migration capabilities. All
 /// migratable device must implement this trait.
 pub trait MigrationHook: StateTransfer {
+    /// Freeze or resume runtime device access independently of snapshot
+    /// completion. Transports without background RAM writers need no action.
+    fn quiesce(&self, paused: bool) -> Result<()> {
+        self.notify_status(
+            true,
+            if paused {
+                MigrationStatus::Active
+            } else {
+                MigrationStatus::Completed
+            },
+        )
+    }
     /// Save device state as `[u8]` with device's `InstanceId` to a `Write`
     /// trait object.
     ///

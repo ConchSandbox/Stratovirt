@@ -20,6 +20,7 @@ use once_cell::sync::Lazy;
 static NOTIFIER_MANAGER: Lazy<RwLock<NotifierManager>> =
     Lazy::new(|| RwLock::new(NotifierManager::new()));
 static VM_PAUSED: AtomicBool = AtomicBool::new(false);
+static VM_QUIESCENT: AtomicBool = AtomicBool::new(false);
 
 pub type PauseNotifyCallback = dyn Fn(bool) + Send + Sync;
 
@@ -71,8 +72,21 @@ pub fn unregister_vm_pause_notifier(id: u64) {
 }
 
 pub fn pause_notify(paused: bool) {
+    if !paused {
+        VM_QUIESCENT.store(false, Ordering::SeqCst);
+    }
     VM_PAUSED.store(paused, Ordering::SeqCst);
     NOTIFIER_MANAGER.read().unwrap().pause_notify(paused);
+}
+
+/// A pause is capture-safe only after every RAM writer and block completion
+/// has drained. Device notification and vCPU state alone do not prove this.
+pub fn set_vm_quiescent(confirmed: bool) {
+    VM_QUIESCENT.store(confirmed, Ordering::SeqCst);
+}
+
+pub fn vm_quiescent() -> bool {
+    VM_QUIESCENT.load(Ordering::SeqCst)
 }
 
 pub fn vm_paused() -> bool {

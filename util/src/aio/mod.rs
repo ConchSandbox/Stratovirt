@@ -953,6 +953,24 @@ impl IoRef {
 }
 
 pub const DEFAULT_IO_TIMEOUT: u64 = 3;
+
+/// Unlike the legacy teardown helper, a capture barrier must report an
+/// incomplete drain rather than logging a warning and declaring success.
+pub fn wait_io_done_checked(io_inflight: &IoRef, timeout_sec: u64, id: &str) -> Result<()> {
+    let cur = Instant::now();
+    while io_inflight.ref_cnt() > 0 {
+        if cur.elapsed() >= Duration::from_secs(timeout_sec) {
+            bail!(
+                "Timed out draining {} in-flight operations for {}",
+                io_inflight.ref_cnt(),
+                id
+            );
+        }
+        yield_now();
+    }
+    Ok(())
+}
+
 pub fn wait_io_done(io_inflight: &IoRef, timeout_sec: u64, id: &str) {
     let cur = Instant::now();
     while io_inflight.ref_cnt() > 0 {
@@ -972,6 +990,15 @@ pub fn wait_io_done(io_inflight: &IoRef, timeout_sec: u64, id: &str) {
 #[cfg(test)]
 mod tests {
     use vmm_sys_util::tempfile::TempFile;
+
+    #[test]
+    fn capture_barrier_rejects_inflight_timeout() {
+        let counter = IoRef::default();
+        let inflight = counter.inc_ref();
+        assert!(wait_io_done_checked(&counter, 0, "test").is_err());
+        drop(inflight);
+        assert!(wait_io_done_checked(&counter, 0, "test").is_ok());
+    }
 
     use super::*;
 

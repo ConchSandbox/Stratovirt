@@ -1995,6 +1995,8 @@ pub struct MemMappings {
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct MemMapping {
+    /// Stable logical backend identity; file extents do not create backends.
+    pub id: String,
     #[serde(rename = "base-host-virt-addr")]
     pub base_host_virt_addr: u64,
     pub size: u64,

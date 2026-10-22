@@ -183,6 +183,29 @@ impl<T: Clone + 'static> FileDriver<T> {
         self.aio.borrow_mut().flush_request()
     }
 
+    pub fn quiesce(&mut self) -> Result<()> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(util::aio::DEFAULT_IO_TIMEOUT);
+        if self.block_prop.iothread.is_none() {
+            self.flush_request()?;
+        }
+        while self.incomplete.load(Ordering::SeqCst) != 0 {
+            // QMP runs on the main event loop. Poll its pending AIO completions
+            // directly while the loop is occupied by stop; a separate I/O
+            // thread continues polling its own completion handler.
+            if self.block_prop.iothread.is_none() {
+                self.aio.borrow_mut().handle_complete()?;
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("Timed out draining block device {}", self.block_prop.id);
+            }
+            std::thread::yield_now();
+        }
+        self.file
+            .sync_all()
+            .with_context(|| format!("Failed to flush block device {}", self.block_prop.id))
+    }
+
     pub fn register_io_event(
         &mut self,
         broken: Arc<AtomicBool>,

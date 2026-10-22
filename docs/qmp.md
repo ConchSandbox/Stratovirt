@@ -506,6 +506,11 @@ Get memory size of guest.
 
 ## Migration
 
+Conch indexed RAM capture uses `stop`, `query-mem-mappings`,
+`query-mem-dirty-bitmap`, `migrate`, `query-migrate` and `cont` within one
+continuous device-quiescence interval. Its mapping/bitmap fields and native
+EXTERNAL semantics are documented in [Conch indexed RAM snapshots](./conch-indexed.md).
+
 ### migrate
 
 Take a snapshot of the VM into the specified directory.
