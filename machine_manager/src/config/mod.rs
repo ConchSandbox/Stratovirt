@@ -210,8 +210,11 @@ impl VmConfig {
                 );
             }
         }
-        if !self.netdevs.is_empty() {
-            bail!("network backends are not supported with indexed RAM");
+        for net in self.netdevs.values() {
+            if net.netdev_type != "tap" || net.vhost_kernel || net.vhost_fds.is_some()
+                || net.macnat || net.queues != 2 || net.tap_fds.as_ref().map(Vec::len) != Some(1) {
+                bail!("indexed RAM requires a single-queue userspace TAP FD backend");
+            }
         }
         for (kind, args) in &self.devices {
             if kind.starts_with("virtio-pmem-") {
@@ -238,6 +241,7 @@ impl VmConfig {
                     | "virtio-pmem-device"
                     | "virtio-pmem-pci"
                     | "vhost-vsock-device"
+                    | "virtio-net-device"
             ) {
                 bail!("device {} is not validated for indexed private RAM", kind);
             }
