@@ -727,8 +727,9 @@ impl<T: Clone + 'static> Aio<T> {
             if is_err {
                 // Fail one request, retry the rest.
                 if let Some(node) = self.aio_in_queue.pop_tail() {
+                    let result = (self.complete_func)(&node.value, -1);
                     self.incomplete_cnt.fetch_sub(1, Ordering::SeqCst);
-                    (self.complete_func)(&(node).value, -1)?;
+                    result?;
                 }
             } else if nr == 0 {
                 // If can't submit any request, break the loop
@@ -953,6 +954,24 @@ impl IoRef {
 }
 
 pub const DEFAULT_IO_TIMEOUT: u64 = 3;
+
+/// Unlike the legacy teardown helper, a capture barrier must report an
+/// incomplete drain rather than logging a warning and declaring success.
+pub fn wait_io_done_checked(io_inflight: &IoRef, timeout_sec: u64, id: &str) -> Result<()> {
+    let cur = Instant::now();
+    while io_inflight.ref_cnt() > 0 {
+        if cur.elapsed() >= Duration::from_secs(timeout_sec) {
+            bail!(
+                "Timed out draining {} in-flight operations for {}",
+                io_inflight.ref_cnt(),
+                id
+            );
+        }
+        yield_now();
+    }
+    Ok(())
+}
+
 pub fn wait_io_done(io_inflight: &IoRef, timeout_sec: u64, id: &str) {
     let cur = Instant::now();
     while io_inflight.ref_cnt() > 0 {
@@ -973,7 +992,72 @@ pub fn wait_io_done(io_inflight: &IoRef, timeout_sec: u64, id: &str) {
 mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
+    #[test]
+    fn capture_barrier_rejects_inflight_timeout() {
+        let counter = IoRef::default();
+        let inflight = counter.inc_ref();
+        assert!(wait_io_done_checked(&counter, 0, "test").is_err());
+        drop(inflight);
+        assert!(wait_io_done_checked(&counter, 0, "test").is_ok());
+    }
+
     use super::*;
+
+    #[test]
+    fn capture_submission_failure_keeps_callback_inflight() {
+        use std::sync::Barrier;
+        #[derive(Clone)]
+        struct Completion {
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+            fail: bool,
+        }
+        struct RejectedSubmission;
+        impl AioContext<Completion> for RejectedSubmission {
+            fn submit(&mut self, _: &[*const AioCb<Completion>]) -> Result<usize> {
+                bail!("injected submission failure")
+            }
+            fn submit_threads_pool(&mut self, _: &[*const AioCb<Completion>]) -> Result<usize> {
+                unreachable!()
+            }
+            fn get_events(&mut self) -> &[AioEvent] { &[] }
+        }
+        fn complete(cb: &AioCb<Completion>, result: i64) -> Result<()> {
+            assert_eq!(result, -1);
+            cb.iocompletecb.entered.wait();
+            cb.iocompletecb.release.wait();
+            if cb.iocompletecb.fail { bail!("injected callback failure"); }
+            Ok(())
+        }
+        for fail in [false, true] {
+            let state = Completion {
+                entered: Arc::new(Barrier::new(2)),
+                release: Arc::new(Barrier::new(2)), fail,
+            };
+            let count = Arc::new(AtomicU64::new(0));
+            let completion = state.clone();
+            let pending = count.clone();
+            let worker = std::thread::spawn(move || {
+                let mut aio = Aio::new(Arc::new(complete), AioEngine::Off, None).unwrap();
+                aio.ctx = Some(Box::new(RejectedSubmission));
+                aio.incomplete_cnt = pending;
+                aio.submit_async(AioCb {
+                    direct: false, req_align: 1, buf_align: 1, discard: false,
+                    write_zeroes: WriteZeroesState::Off,
+                    file: Arc::new(TempFile::new().unwrap().into_file()),
+                    opcode: OpCode::Preadv, iovec: Vec::new(), offset: 0,
+                    nbytes: 0, user_data: 0, iocompletecb: completion, combine_req: None,
+                }).unwrap();
+                aio.process_list()
+            });
+            state.entered.wait();
+            let during_callback = count.load(Ordering::SeqCst);
+            state.release.wait();
+            assert_eq!(worker.join().unwrap().is_err(), fail);
+            assert_eq!(during_callback, 1, "capture observed a completed request while its callback was live");
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+    }
 
     fn perform_sync_rw(
         fsize: usize,
