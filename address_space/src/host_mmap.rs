@@ -465,7 +465,7 @@ impl HostMemMapping {
         sources: &crate::indexed_memory::SourceBindings,
     ) -> Result<Self> {
         use crate::indexed_memory::{
-            extent_file_range, open_source_file, validate_backend, INDEX_PAGE_SIZE,
+            extent_file_range, open_extent_source, validate_backend, ExtentSource, INDEX_PAGE_SIZE,
         };
         use std::os::fd::AsRawFd;
         validate_backend(backend)?;
@@ -497,18 +497,30 @@ impl HostMemMapping {
         let reservation = Reservation(base, length);
         let mut files = std::collections::HashMap::new();
         for extent in &backend.extents {
-            let key = (&extent.source_layer, &extent.source_file);
-            if !files.contains_key(&key) {
-                files.insert(
-                    key,
-                    open_source_file(sources, &extent.source_layer, &extent.source_file)?,
-                );
-            }
-            let file = &files[&key];
-            let (a, b) = extent_file_range(backend, extent)?;
-            if file.metadata()?.len() != b - a {
-                bail!("RAM source length changed: {}", extent.source_file);
-            }
+            let source = match &extent.source {
+                ExtentSource::File {
+                    source_file,
+                    file_offset,
+                } => {
+                    let key = (&extent.source_layer, source_file);
+                    if !files.contains_key(&key) {
+                        files.insert(key, open_extent_source(sources, backend, extent)?.0);
+                    }
+                    let file = &files[&key];
+                    let (a, b) = extent_file_range(backend, extent)?;
+                    if file.metadata()?.len() != b - a {
+                        bail!("RAM source length changed: {source_file}");
+                    }
+                    Ok((file.clone(), *file_offset))
+                }
+                ExtentSource::Blob { .. } => open_extent_source(sources, backend, extent),
+            };
+            let (file, offset) = source.with_context(|| {
+                format!(
+                    "prepare RAM {}:[{}, {}) from {}",
+                    backend.id, extent.start, extent.end, extent.source_layer
+                )
+            })?;
             // SAFETY: validated extents exactly partition this owned reservation.
             // MAP_PRIVATE preserves source bytes and captures later writes as COW.
             let mapped = unsafe {
@@ -518,14 +530,14 @@ impl HostMemMapping {
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_FIXED,
                     file.as_raw_fd(),
-                    i64::try_from(extent.file_offset)?,
+                    i64::try_from(offset)?,
                 )
             };
             if mapped == libc::MAP_FAILED {
                 return Err(std::io::Error::last_os_error()).with_context(|| {
                     format!(
                         "map RAM {}:[{}, {}) from {}",
-                        backend.id, extent.start, extent.end, extent.source_file
+                        backend.id, extent.start, extent.end, extent.source_layer
                     )
                 });
             }

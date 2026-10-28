@@ -211,8 +211,13 @@ impl VmConfig {
             }
         }
         for net in self.netdevs.values() {
-            if net.netdev_type != "tap" || net.vhost_kernel || net.vhost_fds.is_some()
-                || net.macnat || net.queues != 2 || net.tap_fds.as_ref().map(Vec::len) != Some(1) {
+            if net.netdev_type != "tap"
+                || net.vhost_kernel
+                || net.vhost_fds.is_some()
+                || net.macnat
+                || net.queues != 2
+                || net.tap_fds.as_ref().map(Vec::len) != Some(1)
+            {
                 bail!("indexed RAM requires a single-queue userspace TAP FD backend");
             }
         }

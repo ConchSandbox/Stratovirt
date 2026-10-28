@@ -3,15 +3,16 @@
 // StratoVirt is licensed under Mulan PSL v2.
 // See license/LICENSE in the repository for license details.
 
-//! Conch v2 cumulative RAM indexes and private file-source bindings.
+//! Conch cumulative RAM indexes with explicit v2 file and v3 block sources.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -19,39 +20,123 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
 
 pub const INDEX_PAGE_SIZE: u64 = 4096;
+const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MemoryIndex {
+pub struct MemoryIndex<E = MemoryExtent> {
     pub version: u32,
     pub page_size_bytes: u64,
     pub memory_size_bytes: u64,
-    pub backends: Vec<MemoryBackendIndex>,
+    pub backends: Vec<MemoryBackendIndex<E>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MemoryBackendIndex {
+pub struct MemoryBackendIndex<E = MemoryExtent> {
     pub id: String,
     pub ram_offset: u64,
     pub size_bytes: u64,
-    pub extents: Vec<MemoryExtent>,
+    pub extents: Vec<E>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct MemoryExtent {
     pub start: u64,
     pub end: u64,
     pub source_layer: String,
-    pub source_file: String,
-    pub file_offset: u64,
+    pub source: ExtentSource,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SourceBindings {
+#[derive(Debug, Clone)]
+pub enum ExtentSource {
+    File {
+        source_file: String,
+        file_offset: u64,
+    },
+    Blob {
+        blob_offset: u64,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileExtent {
+    start: u64,
+    end: u64,
+    source_layer: String,
+    source_file: String,
+    file_offset: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlobExtent {
+    start: u64,
+    end: u64,
+    source_layer: String,
+    blob_offset: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct V2DirectoryBindings {
     pub version: u32,
     pub sources: HashMap<String, PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerDeviceBinding {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub payload_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct V3DeviceBindings {
+    pub version: u32,
+    pub index_layer: String,
+    pub sources: HashMap<String, LayerDeviceBinding>,
+    // Retain the exact descriptors checked at load time for every backend mmap.
+    #[serde(skip)]
+    devices: HashMap<String, OpenedLayerDevice>,
+}
+
+#[derive(Debug)]
+struct OpenedLayerDevice {
+    file: Arc<File>,
+    payload_end: u64,
+}
+
+#[derive(Debug)]
+pub enum SourceBindings {
+    V2(V2DirectoryBindings),
+    V3(V3DeviceBindings),
+}
+
+impl<'de> Deserialize<'de> for SourceBindings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        match value.get("version").and_then(Value::as_u64) {
+            Some(1) => serde_json::from_value(value)
+                .map(Self::V2)
+                .map_err(de::Error::custom),
+            Some(3) => serde_json::from_value(value)
+                .map(Self::V3)
+                .map_err(de::Error::custom),
+            _ => Err(de::Error::custom("unsupported RAM source bindings version")),
+        }
+    }
+}
+
+impl SourceBindings {
+    fn version(&self) -> u32 {
+        match self {
+            Self::V2(bindings) => bindings.version,
+            Self::V3(bindings) => bindings.version,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -164,13 +249,23 @@ fn decimal(value: &str) -> Result<u64> {
     Ok(value.parse()?)
 }
 
+fn file_extent(extent: &MemoryExtent) -> Result<(&str, u64)> {
+    match &extent.source {
+        ExtentSource::File {
+            source_file,
+            file_offset,
+        } => Ok((source_file, *file_offset)),
+        ExtentSource::Blob { .. } => bail!("v3 blob extent cannot use a v2 source file"),
+    }
+}
+
 pub fn extent_file_range(
     backend: &MemoryBackendIndex,
     extent: &MemoryExtent,
 ) -> Result<(u64, u64)> {
+    let (source_file, file_offset) = file_extent(extent)?;
     let prefix = format!("memory/{}/", backend.id);
-    let name = extent
-        .source_file
+    let name = source_file
         .strip_prefix(&prefix)
         .context("RAM source belongs to a different backend")?;
     let (a, b) = name
@@ -184,9 +279,9 @@ pub fn extent_file_range(
         || b % INDEX_PAGE_SIZE != 0
         || a > extent.start
         || b < extent.end
-        || extent.file_offset != extent.start - a
+        || file_offset != extent.start - a
     {
-        bail!("invalid RAM file range or offset: {}", extent.source_file);
+        bail!("invalid RAM file range or offset: {source_file}");
     }
     Ok((a, b))
 }
@@ -197,6 +292,9 @@ pub fn open_source_file(sources: &SourceBindings, source: &str, relative: &str) 
     if !valid_source(source) {
         bail!("invalid RAM source identity {source}");
     }
+    let SourceBindings::V2(sources) = sources else {
+        bail!("v3 bindings cannot supply a v2 source file");
+    };
     let root = sources
         .sources
         .get(source)
@@ -235,25 +333,288 @@ pub fn open_source_file(sources: &SourceBindings, source: &str, relative: &str) 
     Ok(current)
 }
 
-pub fn load_indexed_memory(index_path: &Path, sources_path: &Path) -> Result<IndexedMemoryInput> {
-    let sources: SourceBindings = decode(&fs::read(sources_path)?)?;
-    if sources.version != 1 || !sources.sources.contains_key("self") {
-        bail!("invalid indexed RAM source bindings version or self");
+fn normalize_index<E>(index: MemoryIndex<E>, convert: impl Fn(E) -> MemoryExtent) -> MemoryIndex {
+    MemoryIndex {
+        version: index.version,
+        page_size_bytes: index.page_size_bytes,
+        memory_size_bytes: index.memory_size_bytes,
+        backends: index
+            .backends
+            .into_iter()
+            .map(|backend| MemoryBackendIndex {
+                id: backend.id,
+                ram_offset: backend.ram_offset,
+                size_bytes: backend.size_bytes,
+                extents: backend.extents.into_iter().map(&convert).collect(),
+            })
+            .collect(),
     }
-    for (key, path) in &sources.sources {
-        if !valid_source(key) || !path.is_absolute() || !fs::symlink_metadata(path)?.is_dir() {
-            bail!("invalid RAM binding {key}");
+}
+
+fn decode_index(data: &[u8]) -> Result<MemoryIndex> {
+    let UniqueValue(value) = serde_json::from_slice(data)?;
+    match value.get("version").and_then(Value::as_u64) {
+        Some(1) => Ok(normalize_index(
+            serde_json::from_value(value)?,
+            |e: FileExtent| MemoryExtent {
+                start: e.start,
+                end: e.end,
+                source_layer: e.source_layer,
+                source: ExtentSource::File {
+                    source_file: e.source_file,
+                    file_offset: e.file_offset,
+                },
+            },
+        )),
+        Some(3) => Ok(normalize_index(
+            serde_json::from_value(value)?,
+            |e: BlobExtent| MemoryExtent {
+                start: e.start,
+                end: e.end,
+                source_layer: e.source_layer,
+                source: ExtentSource::Blob {
+                    blob_offset: e.blob_offset,
+                },
+            },
+        )),
+        _ => bail!("unsupported RAM index version"),
+    }
+}
+
+fn validate_source_bindings(index: &MemoryIndex, sources: &SourceBindings) -> Result<()> {
+    if index.version != sources.version() {
+        bail!("RAM index and source bindings versions differ");
+    }
+    match sources {
+        SourceBindings::V2(bindings) => {
+            if !bindings.sources.contains_key("self") {
+                bail!("v2 RAM source bindings require self");
+            }
+            for (key, path) in &bindings.sources {
+                if !valid_source(key)
+                    || !path.is_absolute()
+                    || !fs::symlink_metadata(path)?.is_dir()
+                {
+                    bail!("invalid RAM directory binding {key}");
+                }
+            }
+        }
+        SourceBindings::V3(bindings) => {
+            if bindings.index_layer == "self" || !valid_source(&bindings.index_layer) {
+                bail!("invalid v3 indexLayer digest");
+            }
+            let referenced: HashSet<_> = index
+                .backends
+                .iter()
+                .flat_map(|b| &b.extents)
+                .map(|e| bindings.resolve(&e.source_layer))
+                .collect();
+            if referenced.len() != bindings.sources.len()
+                || referenced
+                    .iter()
+                    .any(|key| !bindings.sources.contains_key(*key))
+            {
+                bail!("v3 RAM bindings must equal the actual referenced layer set");
+            }
+            for (key, binding) in &bindings.sources {
+                if key == "self"
+                    || !valid_source(key)
+                    || !binding.path.is_absolute()
+                    || binding.size_bytes == 0
+                    || binding.size_bytes > i64::MAX as u64
+                    || binding.size_bytes % INDEX_PAGE_SIZE != 0
+                    || binding.payload_bytes == 0
+                    || binding.payload_bytes % INDEX_PAGE_SIZE != 0
+                    || binding
+                        .payload_bytes
+                        .checked_add(INDEX_PAGE_SIZE)
+                        .is_none_or(|end| end >= binding.size_bytes)
+                {
+                    bail!("invalid RAM block binding {key}");
+                }
+            }
         }
     }
-    let expected = sources.sources["self"].join("memory/index.json");
-    if index_path != expected {
-        bail!("RAM index path must be self/memory/index.json");
+    Ok(())
+}
+
+/// Validate only the fixed header needed for safe mapping. No payload, index,
+/// ancestor traversal, or content digest verification belongs in this path.
+fn validate_blob_header(header: &[u8; 4096], binding: &LayerDeviceBinding) -> Result<u64> {
+    let u32_at = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+    let u64_at = |offset| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+    let payload = u64_at(24);
+    let index_offset = u64_at(32);
+    let index_bytes = u64_at(40);
+    let blob_bytes = u64_at(48);
+    let index_end = index_offset
+        .checked_add(index_bytes)
+        .context("RAM blob index overflow")?;
+    let aligned_end = index_end
+        .checked_add(INDEX_PAGE_SIZE - 1)
+        .context("RAM blob alignment overflow")?
+        & !(INDEX_PAGE_SIZE - 1);
+    if &header[..8] != b"CNCHRAM3"
+        || u32_at(8) != 3
+        || u32_at(12) != 4096
+        || u32_at(16) != 4096
+        || u32_at(20) != 0
+        || header[56..].iter().any(|v| *v != 0)
+        || payload != binding.payload_bytes
+        || payload % INDEX_PAGE_SIZE != 0
+        || payload.checked_add(INDEX_PAGE_SIZE) != Some(index_offset)
+        || index_bytes == 0
+        || blob_bytes > i64::MAX as u64
+        || blob_bytes != aligned_end
+        || blob_bytes != binding.size_bytes
+    {
+        bail!("invalid v3 RAM blob header or binding projection");
     }
-    let mut index_file = open_source_file(&sources, "self", "memory/index.json")?;
-    let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut index_file, &mut data)?;
-    let index = decode(&data)?;
+    Ok(index_offset)
+}
+
+impl V3DeviceBindings {
+    fn resolve<'a>(&'a self, layer: &'a str) -> &'a str {
+        if layer == "self" {
+            &self.index_layer
+        } else {
+            layer
+        }
+    }
+
+    fn open_devices(&mut self) -> Result<()> {
+        let mut devices = HashMap::new();
+        let mut identities = HashSet::new();
+        for (digest, binding) in &self.sources {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&binding.path)
+                .with_context(|| {
+                    format!(
+                        "open RAM block source {digest} at {}",
+                        binding.path.display()
+                    )
+                })?;
+            let metadata = file.metadata()?;
+            if !metadata.file_type().is_block_device() {
+                bail!(
+                    "v3 RAM source is not a block device: {}",
+                    binding.path.display()
+                );
+            }
+            if !identities.insert(metadata.rdev()) {
+                bail!("different RAM layer digests alias the same block device");
+            }
+            let mut capacity = 0u64;
+            // SAFETY: BLKGETSIZE64 writes one u64 into this live local value.
+            let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut capacity) };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error()).context("BLKGETSIZE64 for RAM source");
+            }
+            if capacity != binding.size_bytes {
+                bail!("RAM block capacity differs from binding for {digest}");
+            }
+            let mut header = [0; 4096];
+            file.read_exact_at(&mut header, 0)
+                .context("read RAM block header")?;
+            let payload_end = validate_blob_header(&header, binding).with_context(|| {
+                format!(
+                    "validate RAM block source {digest} at {}",
+                    binding.path.display()
+                )
+            })?;
+            devices.insert(
+                digest.clone(),
+                OpenedLayerDevice {
+                    file: Arc::new(file),
+                    payload_end,
+                },
+            );
+        }
+        self.devices = devices;
+        Ok(())
+    }
+}
+
+pub fn load_indexed_memory(index_path: &Path, sources_path: &Path) -> Result<IndexedMemoryInput> {
+    let mut sources: SourceBindings = decode(&fs::read(sources_path)?)?;
+    let data = match &sources {
+        SourceBindings::V2(bindings) => {
+            let root = bindings
+                .sources
+                .get("self")
+                .context("v2 RAM bindings require self")?;
+            if index_path != root.join("memory/index.json") {
+                bail!("RAM index path must be self/memory/index.json");
+            }
+            let mut file = open_source_file(&sources, "self", "memory/index.json")?;
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut data)?;
+            data
+        }
+        SourceBindings::V3(_) => {
+            if !index_path.is_absolute() {
+                bail!("RAM index path must be absolute");
+            }
+            fs::read(index_path)?
+        }
+    };
+    let index = decode_index(&data)?;
+    validate_source_bindings(&index, &sources)?;
+    if let SourceBindings::V3(bindings) = &mut sources {
+        bindings.open_devices()?;
+    }
     Ok(IndexedMemoryInput { index, sources })
+}
+
+/// Resolve an extent to an owned descriptor and its exact mmap byte offset.
+/// v3 shares the retained descriptor, never reopens a checked device by path.
+pub fn open_extent_source(
+    sources: &SourceBindings,
+    backend: &MemoryBackendIndex,
+    extent: &MemoryExtent,
+) -> Result<(Arc<File>, u64)> {
+    match (&sources, &extent.source) {
+        (
+            SourceBindings::V2(_),
+            ExtentSource::File {
+                source_file,
+                file_offset,
+            },
+        ) => {
+            let (a, b) = extent_file_range(backend, extent)?;
+            let file = open_source_file(sources, &extent.source_layer, source_file)?;
+            if file.metadata()?.len() != b - a {
+                bail!("RAM source size mismatch {source_file}");
+            }
+            Ok((Arc::new(file), *file_offset))
+        }
+        (SourceBindings::V3(bindings), ExtentSource::Blob { blob_offset }) => {
+            let digest = bindings.resolve(&extent.source_layer);
+            let device = bindings
+                .devices
+                .get(digest)
+                .context("RAM block source is not open")?;
+            validate_payload_range(*blob_offset, extent.end - extent.start, device.payload_end)
+                .with_context(|| format!("RAM payload range for {digest}"))?;
+            Ok((device.file.clone(), *blob_offset))
+        }
+        _ => bail!("RAM extent and source binding versions differ"),
+    }
+}
+
+fn validate_payload_range(offset: u64, length: u64, payload_end: u64) -> Result<()> {
+    let end = offset.checked_add(length).context("RAM extent overflow")?;
+    if offset < INDEX_PAGE_SIZE
+        || offset % INDEX_PAGE_SIZE != 0
+        || length == 0
+        || length % INDEX_PAGE_SIZE != 0
+        || end > payload_end
+    {
+        bail!("RAM extent lies outside source payload or is not page aligned");
+    }
+    Ok(())
 }
 
 pub fn validate_backend(backend: &MemoryBackendIndex) -> Result<()> {
@@ -281,7 +642,21 @@ pub fn validate_backend(backend: &MemoryBackendIndex) -> Result<()> {
                 extent.end
             );
         }
-        extent_file_range(backend, extent)?;
+        match &extent.source {
+            ExtentSource::File { .. } => {
+                extent_file_range(backend, extent)?;
+            }
+            ExtentSource::Blob { blob_offset } => {
+                if *blob_offset < INDEX_PAGE_SIZE
+                    || blob_offset % INDEX_PAGE_SIZE != 0
+                    || blob_offset
+                        .checked_add(extent.end - extent.start)
+                        .is_none_or(|end| end > i64::MAX as u64)
+                {
+                    bail!("invalid RAM blob extent offset");
+                }
+            }
+        }
         end = extent.end;
     }
     if end != backend.size_bytes {
@@ -311,7 +686,7 @@ pub fn validate_indexed_memory(
 ) -> Result<()> {
     let index = &input.index;
     if util::unix::host_page_size() != INDEX_PAGE_SIZE
-        || index.version != 1
+        || !matches!(index.version, 1 | 3)
         || index.page_size_bytes != INDEX_PAGE_SIZE
         || expected_size == 0
         || expected_size > isize::MAX as u64
@@ -321,9 +696,7 @@ pub fn validate_indexed_memory(
     {
         bail!("unsupported indexed RAM header or native layout");
     }
-    if input.sources.version != 1 || !input.sources.sources.contains_key("self") {
-        bail!("invalid RAM source bindings");
-    }
+    validate_source_bindings(index, &input.sources)?;
     let mut offset = 0;
     let mut ids = HashSet::new();
     let mut count = 0usize;
@@ -344,11 +717,12 @@ pub fn validate_indexed_memory(
             .checked_add(backend.extents.len())
             .context("RAM extent count overflow")?;
         for extent in &backend.extents {
-            let (a, b) = extent_file_range(backend, extent)?;
-            let file = open_source_file(&input.sources, &extent.source_layer, &extent.source_file)?;
-            if file.metadata()?.len() != b - a {
-                bail!("RAM source size mismatch {}", extent.source_file);
-            }
+            open_extent_source(&input.sources, backend, extent).with_context(|| {
+                format!(
+                    "validate RAM {}:[{}, {}) from {}",
+                    backend.id, extent.start, extent.end, extent.source_layer
+                )
+            })?;
         }
     }
     if offset != expected_size {
@@ -480,9 +854,15 @@ mod tests {
     fn indexed_validation_rejects_bad_layout_and_file_sources() {
         let fixture = Fixture::new();
         let mut input = fixture.input();
-        input.index.backends[0].extents[2].file_offset = 0;
+        input.index.backends[0].extents[2].source = ExtentSource::File {
+            source_file: "memory/mem0/0_12288".into(),
+            file_offset: 0,
+        };
         assert!(validate_indexed_memory(&input, &layout(), 12288).is_err());
-        input.index.backends[0].extents[2].file_offset = 8192;
+        input.index.backends[0].extents[2].source = ExtentSource::File {
+            source_file: "memory/mem0/0_12288".into(),
+            file_offset: 8192,
+        };
         input.index.backends[0].id = "index.json".into();
         assert!(validate_indexed_memory(&input, &layout(), 12288).is_err());
         input.index.backends[0].id = "mem0".into();
@@ -516,15 +896,15 @@ mod tests {
         ] {
             assert!(decode::<SourceBindings>(data.as_bytes()).is_err());
         }
-        assert!(
-            decode::<MemoryBackendIndex>(br#"{"id":"mem0","sizeBytes":4096,"extents":[]}"#)
-                .is_err()
-        );
-        assert!(decode::<MemoryBackendIndex>(
+        assert!(decode::<MemoryBackendIndex<FileExtent>>(
+            br#"{"id":"mem0","sizeBytes":4096,"extents":[]}"#
+        )
+        .is_err());
+        assert!(decode::<MemoryBackendIndex<FileExtent>>(
             br#"{"id":"mem0","ramOffset":0.0,"sizeBytes":4096,"extents":[]}"#
         )
         .is_err());
-        assert!(decode::<MemoryBackendIndex>(
+        assert!(decode::<MemoryBackendIndex<FileExtent>>(
             br#"{"id":"mem0","ramOffset":null,"sizeBytes":4096,"extents":[]}"#
         )
         .is_err());
@@ -550,8 +930,10 @@ mod tests {
                     start: 0,
                     end: 4096,
                     source_layer: "self".into(),
-                    source_file: source,
-                    file_offset: 0,
+                    source: ExtentSource::File {
+                        source_file: source,
+                        file_offset: 0,
+                    },
                 }],
             });
             expected.push(IndexedRamLayout {
@@ -569,10 +951,10 @@ mod tests {
                 memory_size_bytes: 8192,
                 backends,
             },
-            sources: SourceBindings {
+            sources: SourceBindings::V2(V2DirectoryBindings {
                 version: 1,
                 sources,
-            },
+            }),
         };
         validate_indexed_memory(&input, &expected, 8192).unwrap();
         for (i, backend) in input.index.backends.iter().enumerate() {
@@ -587,3 +969,7 @@ mod tests {
         assert!(validate_indexed_memory(&input, &expected, 8192).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "indexed_memory_tests.rs"]
+pub(crate) mod v3_tests;
