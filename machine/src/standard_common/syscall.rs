@@ -291,6 +291,13 @@ fn ioctl_allow_list() -> BpfRule {
     arch_ioctl_allow_list(bpf_rule)
 }
 
+// Linux UAPI asm-generic/mman-common.h. New glibc uses lightweight guards
+// when allocating and reusing thread stacks after seccomp is installed.
+#[cfg(target_env = "gnu")]
+const MADV_GUARD_INSTALL: u32 = 102;
+#[cfg(target_env = "gnu")]
+const MADV_GUARD_REMOVE: u32 = 103;
+
 fn madvise_rule() -> BpfRule {
     #[cfg(any(target_env = "musl", target_env = "ohos"))]
     return BpfRule::new(libc::SYS_madvise)
@@ -304,7 +311,9 @@ fn madvise_rule() -> BpfRule {
         .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_DONTNEED as u32)
         .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_WILLNEED as u32)
         .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_DONTDUMP as u32)
-        .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_REMOVE as u32);
+        .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_REMOVE as u32)
+        .add_constraint(SeccompCmpOpt::Eq, 2, MADV_GUARD_INSTALL)
+        .add_constraint(SeccompCmpOpt::Eq, 2, MADV_GUARD_REMOVE);
 }
 
 fn futex_rule() -> BpfRule {
@@ -323,6 +332,11 @@ fn futex_rule() -> BpfRule {
         .add_constraint(
             SeccompCmpOpt::Eq,
             1,
+            FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME,
+        )
+        .add_constraint(
+            SeccompCmpOpt::Eq,
+            1,
             FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME,
         )
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_WAIT)
@@ -334,4 +348,17 @@ fn futex_rule() -> BpfRule {
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_WAKE_BITSET_PRIVATE)
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_REQUEUE_PRIVATE)
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_LOCK_PI2_PRIVATE);
+}
+
+#[cfg(all(test, target_env = "gnu"))]
+mod tests {
+    #[test]
+    fn glibc_stack_guard_madvise_bpf_standardvm() {
+        crate::micro_common::syscall::tests::check_guard_advice_filter(super::madvise_rule());
+    }
+
+    #[test]
+    fn glibc_thread_join_futex_bpf_standardvm() {
+        crate::micro_common::syscall::tests::check_thread_join_filter(super::futex_rule());
+    }
 }

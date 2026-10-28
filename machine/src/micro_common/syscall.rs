@@ -184,6 +184,13 @@ fn ioctl_allow_list() -> BpfRule {
     arch_ioctl_allow_list(bpf_rule)
 }
 
+// Linux UAPI asm-generic/mman-common.h. New glibc uses lightweight guards
+// when allocating and reusing thread stacks after seccomp is installed.
+#[cfg(target_env = "gnu")]
+const MADV_GUARD_INSTALL: u32 = 102;
+#[cfg(target_env = "gnu")]
+const MADV_GUARD_REMOVE: u32 = 103;
+
 fn madvise_rule() -> BpfRule {
     #[cfg(any(target_env = "musl", target_env = "ohos"))]
     return BpfRule::new(libc::SYS_madvise)
@@ -197,7 +204,9 @@ fn madvise_rule() -> BpfRule {
         .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_DONTNEED as u32)
         .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_WILLNEED as u32)
         .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_DONTDUMP as u32)
-        .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_REMOVE as u32);
+        .add_constraint(SeccompCmpOpt::Eq, 2, libc::MADV_REMOVE as u32)
+        .add_constraint(SeccompCmpOpt::Eq, 2, MADV_GUARD_INSTALL)
+        .add_constraint(SeccompCmpOpt::Eq, 2, MADV_GUARD_REMOVE);
 }
 
 const FUTEX_WAKE_BITSET: u32 = 10;
@@ -221,6 +230,13 @@ fn futex_rule() -> BpfRule {
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_REQUEUE_PRIVATE);
     #[cfg(target_env = "gnu")]
     return BpfRule::new(libc::SYS_futex)
+        // glibc pthread_join waits for the kernel's shared clear_child_tid
+        // futex, including the native snapshot auxiliary writer.
+        .add_constraint(
+            SeccompCmpOpt::Eq,
+            1,
+            FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME,
+        )
         .add_constraint(
             SeccompCmpOpt::Eq,
             1,
@@ -234,4 +250,147 @@ fn futex_rule() -> BpfRule {
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_WAKE_BITSET_PRIVATE)
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_REQUEUE_PRIVATE)
         .add_constraint(SeccompCmpOpt::Eq, 1, FUTEX_LOCK_PI2_PRIVATE);
+}
+
+#[cfg(all(test, target_env = "gnu"))]
+pub(crate) mod tests {
+    use super::*;
+    use util::seccomp::{SeccompOpt, SyscallFilter};
+
+    // Execute the generated BPF in a disposable child so the test harness and
+    // other tests never acquire a process-wide seccomp filter.
+    pub(crate) fn check_guard_advice_filter(mut rule: BpfRule) {
+        const FILTER_ERRNO: u32 = 1000;
+        let mut filter = SyscallFilter::new(SeccompOpt::Errno(FILTER_ERRNO));
+        filter.push(&mut rule);
+        filter.push(&mut BpfRule::new(libc::SYS_exit_group));
+        // SAFETY: fork creates a child; the child only installs the prepared
+        // filter, issues raw syscalls, and exits without rejoining Rust code.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            if filter.realize().is_err() {
+                unsafe { libc::_exit(90) };
+            }
+            for advice in [
+                102,
+                103,
+                libc::MADV_DONTNEED,
+                libc::MADV_WILLNEED,
+                libc::MADV_DONTDUMP,
+                libc::MADV_REMOVE,
+            ] {
+                // A zero-length probe may fail on an older kernel, but only a
+                // rejected BPF rule returns our synthetic errno.
+                let result = unsafe { libc::syscall(libc::SYS_madvise, 0usize, 0usize, advice) };
+                if result == -1 && unsafe { *libc::__errno_location() } == FILTER_ERRNO as i32 {
+                    unsafe { libc::_exit(91) };
+                }
+            }
+            for advice in [
+                libc::MADV_NORMAL,
+                libc::MADV_RANDOM,
+                libc::MADV_DOFORK,
+                100,
+                101,
+                104,
+            ] {
+                let result = unsafe { libc::syscall(libc::SYS_madvise, 0usize, 0usize, advice) };
+                if result != -1 || unsafe { *libc::__errno_location() } != FILTER_ERRNO as i32 {
+                    unsafe { libc::_exit(92) };
+                }
+            }
+            // The additional advice must not accidentally admit other syscalls.
+            let result = unsafe { libc::syscall(libc::SYS_getppid) };
+            let rejected =
+                result == -1 && unsafe { *libc::__errno_location() } == FILTER_ERRNO as i32;
+            unsafe { libc::_exit(if rejected { 0 } else { 93 }) };
+        }
+        let mut status = 0;
+        // SAFETY: child is the exact positive PID returned by fork; status is writable.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status),
+            "seccomp child terminated unexpectedly: {status}"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "generated guard-advice BPF rejected valid advice or broadened access"
+        );
+    }
+
+    #[test]
+    fn glibc_stack_guard_madvise_bpf_microvm() {
+        check_guard_advice_filter(madvise_rule());
+    }
+
+    pub(crate) fn check_thread_join_filter(mut rule: BpfRule) {
+        const FILTER_ERRNO: u32 = 1000;
+        let mut filter = SyscallFilter::new(SeccompOpt::Errno(FILTER_ERRNO));
+        filter.push(&mut rule);
+        filter.push(&mut BpfRule::new(libc::SYS_exit_group));
+        // SAFETY: the child only performs raw syscall probes and _exit after
+        // installing its prepared filter; it never returns to the harness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            if filter.realize().is_err() {
+                unsafe { libc::_exit(90) };
+            }
+            for operation in [
+                FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME,
+                FUTEX_WAIT_PRIVATE,
+                FUTEX_WAKE_PRIVATE,
+            ] {
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        0usize,
+                        operation,
+                        0u32,
+                        0usize,
+                        0usize,
+                        !0u32,
+                    )
+                };
+                if result == -1 && unsafe { *libc::__errno_location() } == FILTER_ERRNO as i32 {
+                    unsafe { libc::_exit(91) };
+                }
+            }
+            for operation in [1u32, 3, FUTEX_WAIT_BITSET, 13, 266, 511] {
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        0usize,
+                        operation,
+                        0u32,
+                        0usize,
+                        0usize,
+                        !0u32,
+                    )
+                };
+                if result != -1 || unsafe { *libc::__errno_location() } != FILTER_ERRNO as i32 {
+                    unsafe { libc::_exit(92) };
+                }
+            }
+            let result = unsafe { libc::syscall(libc::SYS_getppid) };
+            let rejected =
+                result == -1 && unsafe { *libc::__errno_location() } == FILTER_ERRNO as i32;
+            unsafe { libc::_exit(if rejected { 0 } else { 93 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "thread-join filter broadened access or rejected the required operation"
+        );
+    }
+
+    #[test]
+    fn glibc_thread_join_futex_bpf_microvm() {
+        check_thread_join_filter(futex_rule());
+    }
 }
