@@ -328,7 +328,7 @@ pub fn initialize_indexed_tracking(regions: &[(u64, u64, u64)]) -> Result<()> {
         if ret != 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
                 format!(
-                    "register indexed file mapping [{address:#x}, +{size:#x}) for WP-only tracking"
+                    "register indexed private mapping [{address:#x}, +{size:#x}) for WP-only tracking"
                 )
             });
         }
@@ -843,6 +843,164 @@ mod indexed_tracking_tests {
             }
         }
         panic!("owned mapping missing from smaps");
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, losetup, and WP_ASYNC on private block mappings"]
+    fn indexed_v3_block_native_restore_and_early_dirty_tracking() {
+        use crate::indexed_memory::v3_tests::BlockFixture;
+        use crate::{AddressAttr, AddressSpace, Region};
+        use machine_manager::config::SnapshotMemoryMode;
+        use migration::MigrationHook;
+        use std::os::fd::AsRawFd;
+
+        let fixture = BlockFixture::new();
+        let cold_ram = Arc::new(Region::init_container_region(12288, "MachineRam"));
+        let cold_mapping = Arc::new(
+            HostMemMapping::new(GuestAddress(0), None, 12288, None, false, false, false).unwrap(),
+        );
+        cold_ram
+            .add_subregion_not_update(Region::init_ram_region(cold_mapping, "mem0"), 0)
+            .unwrap();
+        let cold_root = Region::init_container_region(u64::MAX, "root");
+        cold_root
+            .add_subregion(
+                Region::init_alias_region(cold_ram.clone(), 0, 4096, "low"),
+                0x10000,
+            )
+            .unwrap();
+        cold_root
+            .add_subregion(
+                Region::init_alias_region(cold_ram.clone(), 4096, 8192, "high"),
+                0x20000,
+            )
+            .unwrap();
+        let cold = AddressSpace::new(cold_root, "cold", Some(cold_ram)).unwrap();
+        let mut state = TempFile::new().unwrap().into_file();
+        cold.save_memory(&mut state, SnapshotMemoryMode::External)
+            .unwrap();
+        let metadata_end = state.stream_position().unwrap();
+        state.write_all(b"ramlist-marker").unwrap();
+        state.rewind().unwrap();
+
+        let ram = Arc::new(Region::init_container_region(12288, "MachineRam"));
+        let restored = AddressSpace::new(
+            Region::init_container_region(u64::MAX, "root"),
+            "restored",
+            Some(ram.clone()),
+        )
+        .unwrap();
+        restored
+            .build_indexed_ram_from_snapshot(&mut state, &fixture.input)
+            .expect("host cannot restore indexed RAM with WP_ASYNC on private block mappings");
+        struct ResetTracker;
+        impl Drop for ResetTracker {
+            fn drop(&mut self) {
+                *backend_state().lock().unwrap() = None;
+            }
+        }
+        let _reset = ResetTracker;
+        let regions = ram.subregions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].name, "mem0");
+        assert_eq!(regions[0].offset().raw_value(), 0);
+        let mapping = regions[0].mem_mapping.as_ref().unwrap();
+        assert!(mapping.is_indexed());
+        assert_eq!(mapping.size(), 12288);
+        let observed = indexed_page_observations(
+            mapping,
+            "block mapping after native build and early WP registration",
+        );
+        assert!(observed
+            .iter()
+            .all(|(_, entry)| !entry.is_present() && entry.is_uffd_wp()));
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+
+        // Native EXTERNAL restore must leave the RamList cursor after metadata.
+        state.rewind().unwrap();
+        restored
+            .restore_indexed_ram_from_snapshot(&mut state)
+            .unwrap();
+        assert_eq!(state.stream_position().unwrap(), metadata_end);
+        let mut marker = [0; 14];
+        state.read_exact(&mut marker).unwrap();
+        assert_eq!(&marker, b"ramlist-marker");
+        let mut data = Vec::new();
+        restored
+            .read(&mut data, GuestAddress(0x10000), 4096, AddressAttr::Ram)
+            .unwrap();
+        assert!(data.iter().all(|v| *v == 1));
+        data.clear();
+        restored
+            .read(&mut data, GuestAddress(0x20000), 8192, AddressAttr::Ram)
+            .unwrap();
+        assert!(data[..4096].iter().all(|v| *v == 0));
+        assert!(data[4096..].iter().all(|v| *v == 3));
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+
+        // Device restoration writes through GPA aliases must count even when
+        // the payload was already zero, before any guest execution starts.
+        restored
+            .write(
+                &mut &vec![0; 4096][..],
+                GuestAddress(0x20000),
+                4096,
+                AddressAttr::Ram,
+            )
+            .unwrap();
+        initialize_indexed_tracking(&[(mapping.host_address(), 12288, 0)]).unwrap();
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![2]);
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+
+        // read(2) writes from kernel context into a private block-backed page.
+        // USER_MODE_ONLY tracking would not cover the VM's kernel writers.
+        let mut writer = TempFile::new().unwrap().into_file();
+        writer.write_all(&[9]).unwrap();
+        writer.rewind().unwrap();
+        // SAFETY: this live mapping owns the byte and writer owns the source fd.
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    writer.as_raw_fd(),
+                    (mapping.host_address() + 8192) as *mut libc::c_void,
+                    1,
+                )
+            },
+            1
+        );
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![4]);
+        let address = mapping.host_address();
+        std::thread::spawn(move || {
+            // SAFETY: the caller retains and joins before releasing this mapping.
+            unsafe { std::ptr::write_volatile(address as *mut u8, 8) };
+        })
+        .join()
+        .unwrap();
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![1]);
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
+
+        // Capturing reads the COW HVA, while another VM still sees immutable sources.
+        let peer = fixture.mapping();
+        // SAFETY: both mappings retain their complete ranges.
+        unsafe {
+            assert_eq!(*(mapping.host_address() as *const u8), 8);
+            assert_eq!(*((mapping.host_address() + 8192) as *const u8), 9);
+            assert_eq!(*(peer.host_address() as *const u8), 1);
+            assert_eq!(*((peer.host_address() + 8192) as *const u8), 3);
+        }
+        let mut captured = TempFile::new().unwrap().into_file();
+        restored
+            .save_memory(&mut captured, SnapshotMemoryMode::Full)
+            .unwrap();
+        captured
+            .seek(std::io::SeekFrom::Start(metadata_end))
+            .unwrap();
+        let mut bytes = vec![0; 12288];
+        captured.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes[0], 8);
+        assert!(bytes[4096..8192].iter().all(|v| *v == 0));
+        assert_eq!(bytes[8192], 9);
+        assert_eq!(query_and_reset_dirty_bitmap().unwrap().bitmap, vec![0]);
     }
 
     /// Host qualification test: failure is intentional if mandatory kernel
