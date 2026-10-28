@@ -81,6 +81,7 @@
 //! ```
 
 pub mod error;
+pub mod indexed_memory;
 pub mod uffd;
 
 mod address;
@@ -94,7 +95,9 @@ mod state;
 pub use crate::address_space::{AddressSpace, RegionCache};
 pub use address::{AddressAttr, AddressRange, GuestAddress};
 pub use error::AddressSpaceError;
-pub use host_mmap::{create_backend_mem, create_default_mem, FileBackend, HostMemMapping};
+pub use host_mmap::{
+    create_backend_mem, create_default_mem, set_host_memory_policy, FileBackend, HostMemMapping,
+};
 pub use listener::{Listener, ListenerReqType, MemSlot};
 pub use ramlist::{register_ram_list, register_ram_region, unregister_ram_region};
 pub use region::{FlatRange, Region, RegionIoEventFd, RegionType};
