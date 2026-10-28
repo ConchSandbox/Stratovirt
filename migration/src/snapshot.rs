@@ -47,6 +47,8 @@ const DEVICE_PATH_SUFFIX: &str = "state";
 pub enum RestoreMode {
     /// Directly mmap the memory snapshot file as the RAM backend.
     Mapped,
+    /// Guest RAM is already established from a validated cumulative index.
+    Indexed,
     /// Read/copy memory from the snapshot file into pre-allocated RAM.
     Copy,
     /// Guest RAM pages are served on demand by the external uffd daemon
@@ -242,6 +244,9 @@ impl MigrationManager {
                 if snapshot_memory == SnapshotMemoryMode::External =>
             {
                 bail!("memory=external requires UFFD restore")
+            }
+            RestoreMode::Indexed if snapshot_memory != SnapshotMemoryMode::External => {
+                bail!("Indexed restore requires an EXTERNAL memory snapshot")
             }
             RestoreMode::Uffd { memory, .. } if memory != snapshot_memory => {
                 bail!("Incoming memory mode does not match snapshot memory file")

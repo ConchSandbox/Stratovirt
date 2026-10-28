@@ -187,7 +187,20 @@ pub fn parse_migrate_uri(uri: &str) -> Result<IncomingConfig> {
 impl VmConfig {
     /// Add incoming mode and path.
     pub fn add_incoming(&mut self, config: &str) -> Result<()> {
-        let incoming_cfg = parse_incoming_uri(config)?;
+        let incoming_cfg = if self.machine_config.mem_config.mem_map.is_some() {
+            let cfg = IncomingConfig::from_str(config)?;
+            cfg.check_common_valid()?;
+            if cfg.mode != MigrateMode::File
+                || cfg.memory != SnapshotMemoryMode::External
+                || !cfg.mapped
+                || cfg.uffd_sock.is_some()
+            {
+                bail!("indexed RAM requires file incoming,memory=external,mapped=true without uffd_sock");
+            }
+            cfg
+        } else {
+            parse_incoming_uri(config)?
+        };
         if incoming_cfg.mode == MigrateMode::Unknown {
             bail!("Unsupported incoming unix path type");
         }
@@ -403,5 +416,78 @@ mod tests {
                 memory: SnapshotMemoryMode::External,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod indexed_config_tests {
+    use super::*;
+
+    fn indexed() -> VmConfig {
+        let mut vm = VmConfig::default();
+        vm.machine_config.mem_config.mem_map = Some("/ram/current/memory/index.json".into());
+        vm.machine_config.mem_config.mem_map_sources = Some("/run/sources.json".into());
+        vm.add_incoming("file:/snapshot,memory=external,mapped=true")
+            .unwrap();
+        vm
+    }
+
+    #[test]
+    fn indexed_incoming_requires_pair_and_compatible_mode() {
+        let mut vm = indexed();
+        assert!(vm.check_indexed_memory().is_ok());
+        assert!(vm
+            .add_incoming("file:/snapshot,memory=full,mapped=true")
+            .is_err());
+        assert!(vm
+            .add_incoming("file:/snapshot,memory=external,mapped=false,uffd_sock=/run/handler")
+            .is_err());
+        vm.machine_config.mem_config.mem_map_sources = None;
+        assert!(vm.check_indexed_memory().is_err());
+    }
+
+    #[test]
+    fn indexed_ram_excludes_shared_preallocation_and_unadapted_devices() {
+        let mut vm = indexed();
+        vm.machine_config.mem_config.mem_share = true;
+        assert!(vm.check_indexed_memory().is_err());
+        vm.machine_config.mem_config.mem_share = false;
+        vm.machine_config.mem_config.mem_prealloc = true;
+        assert!(vm.check_indexed_memory().is_err());
+        vm.machine_config.mem_config.mem_prealloc = false;
+        vm.devices.push((
+            "vhost-user-blk-device".into(),
+            "vhost-user-blk-device,id=d".into(),
+        ));
+        assert!(vm.check_indexed_memory().is_err());
+        vm.devices = vec![("vhost-vsock-pci".into(), "vhost-vsock-pci,id=v".into())];
+        assert!(vm.check_indexed_memory().is_err());
+        vm.devices = vec![(
+            "vhost-vsock-device".into(),
+            "vhost-vsock-device,id=v".into(),
+        )];
+        assert!(vm.check_indexed_memory().is_ok());
+    }
+
+    #[test]
+    fn indexed_restore_rejects_standard_vm_capture_profile() {
+        let mut vm = indexed();
+        vm.machine_config.mach_type = super::super::MachineType::StandardVm;
+        assert!(vm.check_indexed_memory().is_err());
+    }
+
+    #[test]
+    fn indexed_numa_backend_has_private_source_while_pmem_keeps_its_path() {
+        let mut vm = indexed();
+        vm.add_mem_backend("memory-backend-file,id=mem0,size=128M,share=off")
+            .unwrap();
+        vm.add_numa("node,nodeid=0,cpus=0,memdev=mem0").unwrap();
+        vm.add_mem_backend(
+            "memory-backend-file,id=lower-0,size=2M,share=off,mem-path=/layers/layer.erofs",
+        )
+        .unwrap();
+        assert!(vm.check_indexed_memory().is_ok());
+        vm.object.mem_object.get_mut("mem0").unwrap().share = Some(true);
+        assert!(vm.check_indexed_memory().is_err());
     }
 }

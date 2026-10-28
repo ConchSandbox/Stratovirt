@@ -550,8 +550,25 @@ pub(crate) fn build_mem_mappings(machine_ram: &Region) -> Result<qmp_schema::Mem
             .with_context(|| format!("RAM region {} has no host address", region.name))?;
         let size = region.size();
         let page_size = region_page_size(&region);
+        if region.name == "index.json"
+            || region.name.is_empty()
+            || !region.name.as_bytes()[0].is_ascii_alphanumeric()
+            || !region
+                .name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+            || mappings
+                .iter()
+                .any(|mapping: &qmp_schema::MemMapping| mapping.id == region.name)
+        {
+            bail!(
+                "Invalid or duplicated logical RAM backend ID {:?}",
+                region.name
+            );
+        }
 
         mappings.push(qmp_schema::MemMapping {
+            id: region.name.clone(),
             base_host_virt_addr,
             size,
             offset: next_offset,
@@ -909,13 +926,41 @@ pub trait MachineOps: MachineLifecycle {
             File::open(&snapshot_path).with_context(|| "Failed to open memory snapshot file")?;
         let memory_header = MigrationManager::restore_header(&mut memory_file)?;
         memory_header.check_header()?;
-        if memory_header.format != FileFormat::MemoryFull {
-            bail!("Invalid memory snapshot file");
+        if let Some(index_path) = &mem_config.mem_map {
+            if memory_header.format != FileFormat::MemoryExternal {
+                bail!("Indexed RAM requires an EXTERNAL native memory file");
+            }
+            let sources_path = mem_config
+                .mem_map_sources
+                .as_ref()
+                .context("Missing indexed RAM source bindings")?;
+            let indexed = address_space::indexed_memory::load_indexed_memory(
+                std::path::Path::new(index_path),
+                std::path::Path::new(sources_path),
+            )?;
+            sys_mem
+                .build_indexed_ram_from_snapshot(&mut memory_file, &indexed)
+                .context("Failed to build indexed RAM and early dirty tracking")?;
+            if let Some(backends) = &mem_config.membackend_objs {
+                for region in self.get_vm_ram().subregions() {
+                    if let Some(config) = backends.iter().find(|backend| backend.id == region.name)
+                    {
+                        let mapping = region
+                            .mem_mapping
+                            .as_ref()
+                            .context("Indexed RAM backend has no host mapping")?;
+                        address_space::set_host_memory_policy(mapping, config)?;
+                    }
+                }
+            }
+        } else {
+            if memory_header.format != FileFormat::MemoryFull {
+                bail!("Invalid memory snapshot file");
+            }
+            sys_mem
+                .build_mapped_ram_from_snapshot(&mut memory_file)
+                .context("Failed to restore mapped guest memory layout")?;
         }
-
-        sys_mem
-            .build_mapped_ram_from_snapshot(&mut memory_file)
-            .with_context(|| "Failed to restore mapped guest memory layout")?;
         let expected_ram_states = self.expected_ram_region_states(mem_config)?;
         let expected_alias_states = self.expected_alias_region_states(mem_config);
         sys_mem
@@ -3584,10 +3629,22 @@ fn start_incoming_migration(
     freeze_cpu: bool,
 ) -> Result<()> {
     let migrate_info = vm.lock().unwrap().get_migrate_info();
+    let indexed = vm
+        .lock()
+        .unwrap()
+        .get_vm_config()
+        .lock()
+        .unwrap()
+        .machine_config
+        .mem_config
+        .mem_map
+        .is_some();
     let path = migrate_info.uri;
     match migrate_info.mode {
         MigrateMode::File => {
-            let restore_mode = if let Some(uffd_sock) = migrate_info.uffd_sock.as_ref() {
+            let restore_mode = if indexed {
+                RestoreMode::Indexed
+            } else if let Some(uffd_sock) = migrate_info.uffd_sock.as_ref() {
                 RestoreMode::Uffd {
                     socket_path: uffd_sock.clone(),
                     memory: migrate_info.memory,
@@ -4085,6 +4142,8 @@ mod tests {
         let mappings = build_mem_mappings(&root).unwrap();
 
         assert_eq!(mappings.mappings.len(), 2);
+        assert_eq!(mappings.mappings[0].id, "low");
+        assert_eq!(mappings.mappings[1].id, "high");
         assert_eq!(mappings.mappings[0].base_host_virt_addr, low.host_address());
         assert_eq!(mappings.mappings[0].size, 0x2000);
         assert_eq!(mappings.mappings[0].offset, 0);
@@ -4094,6 +4153,17 @@ mod tests {
         );
         assert_eq!(mappings.mappings[1].size, 0x1000);
         assert_eq!(mappings.mappings[1].offset, 0x2000);
+    }
+
+    #[test]
+    fn capture_memory_mapping_rejects_reserved_backend_name() {
+        let root = Region::init_container_region(0x1000, "root");
+        let mapping = Arc::new(
+            HostMemMapping::new(GuestAddress(0), None, 0x1000, None, false, false, false).unwrap(),
+        );
+        root.add_subregion_not_update(Region::init_ram_region(mapping, "index.json"), 0)
+            .unwrap();
+        assert!(build_mem_mappings(&root).is_err());
     }
 
     #[test]
