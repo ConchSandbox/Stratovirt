@@ -23,7 +23,7 @@ use std::thread::yield_now;
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use clap::Parser;
-use log::{error, info, warn};
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
@@ -48,6 +48,7 @@ use machine_manager::config::{
     DriveConfig, DriveFile, VmConfig, DEFAULT_VIRTQUEUE_SIZE, MAX_VIRTIO_QUEUE,
 };
 use machine_manager::event_loop::{register_event_helper, unregister_event_helper, EventLoop};
+use machine_manager::notifier::capture_paused;
 use migration::{
     migration::Migratable, DeviceStateDesc, MigrationHook, MigrationManager, MigrationStatus,
     StateTransfer,
@@ -1107,7 +1108,7 @@ impl Block {
             req_align: 1,
             buf_align: 1,
             drive_files,
-            migrating: Arc::new(AtomicBool::new(false)),
+            migrating: Arc::new(AtomicBool::new(capture_paused())),
             processing_queue: Arc::new(AtomicBool::new(false)),
             queue_evts: Arc::new(Mutex::new(Vec::new())),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -1465,6 +1466,12 @@ impl StateTransfer for Block {
     fn set_state_mut(&mut self, state: &[u8], _version: u32) -> Result<()> {
         let state: BlockState = serde_json::from_slice(state)
             .with_context(|| migration::error::MigrationError::FromBytesError("BLOCK"))?;
+        if state.config_space.capacity != self.disk_sectors {
+            bail!(
+                "Snapshot block capacity differs from device {}",
+                self.blk_cfg.id
+            );
+        }
         self.base.device_features = state.device_features;
         self.base.driver_features = state.driver_features;
         self.base.broken.store(state.broken, Ordering::SeqCst);
@@ -1478,6 +1485,28 @@ impl StateTransfer for Block {
 }
 
 impl MigrationHook for Block {
+    fn quiesce(&self, paused: bool) -> Result<()> {
+        self.migrating.store(paused, Ordering::SeqCst);
+        if paused {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(util::aio::DEFAULT_IO_TIMEOUT);
+            while self.processing_queue.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    bail!("Timed out stopping block queue {}", self.blk_cfg.id);
+                }
+                yield_now();
+            }
+            if let Some(backend) = &self.block_backend {
+                backend.lock().unwrap().quiesce()?;
+            }
+        } else {
+            for evt in self.queue_evts.lock().unwrap().iter() {
+                evt.write(1).context("Failed to resume block queue")?;
+            }
+        }
+        Ok(())
+    }
+
     fn resume(&mut self) -> Result<()> {
         let locked_evts = self.queue_evts.lock().unwrap();
         for evt in locked_evts.iter() {
@@ -1492,24 +1521,14 @@ impl MigrationHook for Block {
         if save {
             match status {
                 MigrationStatus::Active => {
-                    self.migrating.store(true, Ordering::SeqCst);
-                    if self.block_backend.is_none() {
-                        return Ok(());
-                    }
-                    let backend = self.block_backend.as_ref().unwrap();
-                    let incomplete = backend.lock().unwrap().get_inflight();
-                    let id = self.blk_cfg.id.clone();
-                    info!("Drain the inflight IO for block device {}", id);
-                    while incomplete.load(Ordering::SeqCst) != 0
-                        || self.processing_queue.load(Ordering::SeqCst)
-                    {
-                        yield_now();
-                    }
+                    self.quiesce(true)?;
                 }
                 MigrationStatus::Completed
                 | MigrationStatus::Failed
                 | MigrationStatus::Canceled => {
-                    self.migrating.store(false, Ordering::SeqCst);
+                    if !capture_paused() {
+                        self.quiesce(false)?;
+                    }
                 }
                 _ => {}
             }
@@ -1531,6 +1550,32 @@ mod tests {
     use address_space::{AddressAttr, GuestAddress};
     use machine_manager::config::{str_slip_to_clap, VmConfig, DEFAULT_VIRTQUEUE_SIZE};
     use machine_manager::temp_cleaner::TempCleaner;
+
+    #[test]
+    fn capture_stop_waits_for_queue_processing() {
+        let block = Block::default();
+        block.processing_queue.store(true, Ordering::SeqCst);
+        let processing = block.processing_queue.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            processing.store(false, Ordering::SeqCst);
+        });
+        block.quiesce(true).unwrap();
+        assert!(!block.processing_queue.load(Ordering::SeqCst));
+        assert!(block.migrating.load(Ordering::SeqCst));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn capture_block_restore_rejects_changed_capacity() {
+        let mut block = Block::default();
+        let mut state: BlockState =
+            serde_json::from_slice(&block.get_state_vec().unwrap()).unwrap();
+        state.config_space.capacity = 16;
+        assert!(block
+            .set_state_mut(&serde_json::to_vec(&state).unwrap(), 0)
+            .is_err());
+    }
 
     const QUEUE_NUM_BLK: usize = 1;
     const CONFIG_SPACE_SIZE: usize = 60;

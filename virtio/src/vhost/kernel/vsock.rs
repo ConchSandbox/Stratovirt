@@ -11,7 +11,7 @@
 // See the Mulan PSL v2 for more details.
 
 use std::os::unix::io::RawFd;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -29,6 +29,7 @@ use crate::{
 use address_space::{AddressAttr, AddressSpace};
 use machine_manager::config::{get_pci_df, parse_bool, valid_id, DEFAULT_VIRTQUEUE_SIZE};
 use machine_manager::event_loop::{register_event_helper, unregister_event_helper};
+use machine_manager::notifier::{capture_paused, capture_quiescence_enabled, vm_quiescent};
 use migration::{DeviceStateDesc, FieldDesc, MigrationHook, MigrationManager, StateTransfer};
 use migration_derive::{ByteCode, Desc};
 use util::byte_code::ByteCode;
@@ -133,9 +134,15 @@ pub struct Vsock {
     interrupt_cb: Option<Arc<VirtioInterrupt>>,
     /// Save irqfd used for vhost-vsock
     call_events: Vec<Arc<EventFd>>,
+    reset_pending: AtomicBool,
+    notify_handler: Option<Arc<Mutex<VhostIoHandler>>>,
 }
 
 impl Vsock {
+    fn capture_enabled(&self) -> bool {
+        capture_quiescence_enabled() && self.vsock_cfg.classtype == "vhost-vsock-device"
+    }
+
     pub fn new(cfg: &VsockConfig, mem_space: &Arc<AddressSpace>) -> Self {
         Vsock {
             base: VirtioBase::new(VIRTIO_TYPE_VSOCK, QUEUE_NUM_VSOCK, DEFAULT_VIRTQUEUE_SIZE),
@@ -147,6 +154,8 @@ impl Vsock {
             event_queue: None,
             interrupt_cb: None,
             call_events: Vec::new(),
+            reset_pending: AtomicBool::new(false),
+            notify_handler: None,
         }
     }
 
@@ -321,7 +330,7 @@ impl VirtioDevice for Vsock {
         }
 
         backend.set_guest_cid(cid)?;
-        backend.set_running(true)?;
+        backend.set_running(!self.capture_enabled() || !capture_paused())?;
 
         if self.call_events.is_empty() {
             let handler = VhostIoHandler {
@@ -329,8 +338,10 @@ impl VirtioDevice for Vsock {
                 host_notifies,
                 device_broken: self.base.broken.clone(),
             };
-            let notifiers = EventNotifierHelper::internal_notifiers(Arc::new(Mutex::new(handler)));
+            let handler = Arc::new(Mutex::new(handler));
+            let notifiers = EventNotifierHelper::internal_notifiers(handler.clone());
             register_event_helper(notifiers, None, &mut self.base.deactivate_evts)?;
+            self.notify_handler = Some(handler);
         }
 
         self.base.broken.store(false, Ordering::SeqCst);
@@ -341,6 +352,7 @@ impl VirtioDevice for Vsock {
     fn deactivate(&mut self) -> Result<()> {
         unregister_event_helper(None, &mut self.base.deactivate_evts)?;
         self.call_events.clear();
+        self.notify_handler = None;
 
         Ok(())
     }
@@ -352,12 +364,15 @@ impl VirtioDevice for Vsock {
 
 impl StateTransfer for Vsock {
     fn get_state_vec(&self) -> Result<Vec<u8>> {
+        if self.capture_enabled() && !vm_quiescent() {
+            bail!("Vsock state requires a confirmed quiescent interval");
+        }
         Result::with_context(self.backend.as_ref().unwrap().set_running(false), || {
             "Failed to set vsock backend stopping"
         })?;
 
-        let last_avail_idx_0 = self.backend.as_ref().unwrap().get_vring_base(0).unwrap();
-        let last_avail_idx_1 = self.backend.as_ref().unwrap().get_vring_base(1).unwrap();
+        let last_avail_idx_0 = self.backend.as_ref().unwrap().get_vring_base(0)?;
+        let last_avail_idx_1 = self.backend.as_ref().unwrap().get_vring_base(1)?;
         let state = VsockState {
             device_features: self.base.device_features,
             driver_features: self.base.driver_features,
@@ -366,12 +381,13 @@ impl StateTransfer for Vsock {
             broken: self.base.broken.load(Ordering::SeqCst),
         };
 
-        Result::with_context(self.backend.as_ref().unwrap().set_running(true), || {
-            "Failed to set vsock backend running"
-        })?;
-        Result::with_context(self.transport_reset(), || {
-            "Failed to send vsock transport reset event"
-        })?;
+        if !self.capture_enabled() {
+            // Preserve native snapshot behavior outside the MMIO capture profile.
+            self.backend.as_ref().unwrap().set_running(true)
+                .context("Failed to set vsock backend running")?;
+            self.transport_reset().context("Failed to send vsock transport reset event")?;
+        }
+        // MMIO capture keeps the backend stopped until cont and preserves source connections.
 
         Ok(state.as_bytes().to_vec())
     }
@@ -393,13 +409,40 @@ impl StateTransfer for Vsock {
 }
 
 impl MigrationHook for Vsock {
-    fn resume(&mut self) -> Result<()> {
-        Result::with_context(self.transport_reset(), || {
-            "Failed to resume virtio vsock device"
-        })?;
-
+    fn quiesce(&self, paused: bool) -> Result<()> {
+        if !self.capture_enabled() || !self.device_activated() {
+            return Ok(());
+        }
+        let backend = self.backend.as_ref().context("Missing vsock backend")?;
+        if paused {
+            // The kernel detaches each queue backend while holding its queue
+            // mutex. Existing RAM access under that mutex has finished; later
+            // workers see the detached backend before touching guest RAM.
+            backend.set_running(false)?;
+            if let Some(handler) = &self.notify_handler {
+                handler.lock().unwrap().drain_notifications()?;
+            }
+        } else {
+            if self.reset_pending.load(Ordering::SeqCst) {
+                self.transport_reset()?;
+                self.reset_pending.store(false, Ordering::SeqCst);
+            }
+            backend.set_running(true)?;
+        }
         Ok(())
     }
+
+    fn resume(&mut self) -> Result<()> {
+        if !self.capture_enabled() {
+            return self.transport_reset().context("Failed to resume virtio vsock device");
+        }
+        self.reset_pending.store(true, Ordering::SeqCst);
+        if !capture_paused() {
+            self.quiesce(false)?;
+        }
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]

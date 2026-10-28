@@ -153,6 +153,18 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
+    /// Runtime capture barriers are limited to Conch's MMIO device profile.
+    /// This also covers the cold boot that produces the first external snapshot.
+    pub fn supports_capture_quiescence(&self) -> bool {
+        self.machine_config.mach_type == MachineType::MicroVm
+            && self.virtio_serial.is_none()
+            && self.netdevs.is_empty()
+            && self.devices.iter().all(|(kind, _)| matches!(
+                kind.as_str(),
+                "virtio-blk-device" | "virtio-pmem-device" | "vhost-vsock-device"
+            ))
+    }
+
     /// Check whether the RAM backing supports vhost-user devices.
     pub fn check_vhost_user_memory(&self) -> Result<()> {
         if self.machine_config.mem_config.hugepages == HugePageConfig::Hugetlb2M {
@@ -804,6 +816,22 @@ pub fn parse_size(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_profile_covers_cold_mmio_and_excludes_pci() {
+        let mut config = VmConfig::default();
+        config.devices = ["virtio-blk-device", "virtio-pmem-device", "vhost-vsock-device"]
+            .iter().map(|kind| (kind.to_string(), kind.to_string())).collect();
+        assert!(config.supports_capture_quiescence());
+        for kind in ["vhost-vsock-pci", "virtio-blk-pci", "virtio-pmem-pci",
+                     "virtio-serial-device", "virtio-balloon-device"] {
+            let mut unsupported = config.clone();
+            unsupported.devices.push((kind.into(), kind.into()));
+            assert!(!unsupported.supports_capture_quiescence(), "{kind}");
+        }
+        config.machine_config.mach_type = MachineType::StandardVm;
+        assert!(!config.supports_capture_quiescence());
+    }
 
     #[cfg(feature = "trace")]
     #[test]

@@ -25,9 +25,7 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{Queue, QueueConfig, VirtioInterrupt, VirtioInterruptType};
-use util::loop_context::{
-    read_fd, EventNotifier, EventNotifierHelper, NotifierCallback, NotifierOperation,
-};
+use util::loop_context::{EventNotifier, EventNotifierHelper, NotifierCallback, NotifierOperation};
 
 /// Vhost vring call notify structure.
 pub struct VhostNotify {
@@ -124,31 +122,49 @@ pub struct VhostIoHandler {
     device_broken: Arc<AtomicBool>,
 }
 
+impl VhostIoHandler {
+    /// Settle an event only when an eventfd counter was actually consumed.
+    /// A stop barrier may already have drained a notification returned by
+    /// epoll; replaying that stale event would mutate interrupt state later.
+    fn drain_notification(&self, fd: RawFd) -> Result<()> {
+        for notify in &self.host_notifies {
+            if notify.notify_evt.as_raw_fd() != fd {
+                continue;
+            }
+            match notify.notify_evt.read() {
+                Ok(_) => {
+                    if !self.device_broken.load(Ordering::SeqCst) {
+                        (self.interrupt_cb)(
+                            &VirtioInterruptType::Vring,
+                            Some(&notify.queue.lock().unwrap()),
+                            false,
+                        )?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn drain_notifications(&self) -> Result<()> {
+        for notify in &self.host_notifies {
+            self.drain_notification(notify.notify_evt.as_raw_fd())?;
+        }
+        Ok(())
+    }
+}
+
 impl EventNotifierHelper for VhostIoHandler {
     fn internal_notifiers(vhost_handler: Arc<Mutex<Self>>) -> Vec<EventNotifier> {
         let mut notifiers = Vec::new();
 
         let vhost = vhost_handler.clone();
         let handler: Rc<NotifierCallback> = Rc::new(move |_, fd: RawFd| {
-            read_fd(fd);
             let locked_vhost_handler = vhost.lock().unwrap();
-            if locked_vhost_handler.device_broken.load(Ordering::SeqCst) {
-                return None;
-            }
-            for host_notify in locked_vhost_handler.host_notifies.iter() {
-                if host_notify.notify_evt.as_raw_fd() != fd {
-                    continue;
-                }
-                if let Err(e) = (locked_vhost_handler.interrupt_cb)(
-                    &VirtioInterruptType::Vring,
-                    Some(&host_notify.queue.lock().unwrap()),
-                    false,
-                ) {
-                    error!(
-                        "Failed to trigger interrupt for vhost device, error is {:?}",
-                        e
-                    );
-                }
+            if let Err(e) = locked_vhost_handler.drain_notification(fd) {
+                error!("Failed to settle vhost notification: {:?}", e);
             }
             None as Option<Vec<EventNotifier>>
         });
@@ -163,5 +179,45 @@ impl EventNotifierHelper for VhostIoHandler {
         }
 
         notifiers
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn capture_drains_pending_interrupt_without_replaying_stale_event() {
+        let event = Arc::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let callback: Arc<VirtioInterrupt> = Arc::new(Box::new(move |_, _, _| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let queue = Queue::new(QueueConfig::new(256), crate::QUEUE_TYPE_SPLIT_VRING).unwrap();
+        let handler = VhostIoHandler {
+            interrupt_cb: callback,
+            host_notifies: vec![VhostNotify {
+                notify_evt: event.clone(),
+                queue: Arc::new(Mutex::new(queue)),
+            }],
+            device_broken: Arc::new(AtomicBool::new(false)),
+        };
+        event.write(1).unwrap();
+        handler.drain_notifications().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        handler.drain_notification(event.as_raw_fd()).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        event.write(1).unwrap();
+        handler.drain_notification(event.as_raw_fd()).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        handler.device_broken.store(true, Ordering::SeqCst);
+        event.write(1).unwrap();
+        handler.drain_notifications().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(event.read().unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+            "broken device left a level-triggered eventfd readable");
     }
 }

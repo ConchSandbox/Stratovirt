@@ -49,6 +49,10 @@ pub(crate) static MIGRATION_MANAGER: Lazy<MigrationManager> = Lazy::new(|| Migra
 /// This trait is a symbol of device's migration capabilities. All
 /// migratable device must implement this trait.
 pub trait MigrationHook: StateTransfer {
+    /// Capture-capable devices opt in independently of migration notifications.
+    fn quiesce(&self, _paused: bool) -> Result<()> {
+        Ok(())
+    }
     /// Save device state as `[u8]` with device's `InstanceId` to a `Write`
     /// trait object.
     ///
@@ -525,5 +529,25 @@ mod tests {
             MigrationManager::get_desc_alias("DeviceV2State").unwrap(),
             translate_id("DeviceV2State")
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_hook_tests {
+    use super::*;
+    struct MigrationOnlyDevice;
+    impl StateTransfer for MigrationOnlyDevice {
+        fn get_state_vec(&self) -> Result<Vec<u8>> { Ok(Vec::new()) }
+        fn get_device_alias(&self) -> u64 { 0 }
+    }
+    impl MigrationHook for MigrationOnlyDevice {
+        fn notify_status(&self, _: bool, _: MigrationStatus) -> Result<()> {
+            bail!("runtime quiescence reached a migration-only handler")
+        }
+    }
+    #[test]
+    fn capture_default_hook_leaves_migration_only_devices_alone() {
+        MigrationOnlyDevice.quiesce(true).unwrap();
+        MigrationOnlyDevice.quiesce(false).unwrap();
     }
 }

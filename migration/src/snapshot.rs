@@ -136,6 +136,17 @@ impl MigrationManager {
         SNAPSHOT_WRITERS_ACTIVE.load(Ordering::SeqCst)
     }
 
+    /// A runtime device barrier does not change migration status.
+    pub fn quiesce_devices(paused: bool) -> Result<()> {
+        let vmm = MIGRATION_MANAGER.vmm.read().unwrap();
+        for transport in vmm.transports.values() {
+            transport.lock().unwrap().quiesce(paused)?;
+        }
+        for device in vmm.devices.values() {
+            device.lock().unwrap().quiesce(paused)?;
+        }
+        Ok(())
+    }
     /// Save snapshot for `VM`.
     ///
     /// # Notes
@@ -149,6 +160,9 @@ impl MigrationManager {
     /// * `path` - snapshot dir path. If path dir not exists, will create it.
     pub fn save_snapshot(path: &str, memory: SnapshotMemoryMode) -> Result<()> {
         let _writers = SnapshotWriterGuard::acquire()?;
+        if memory == SnapshotMemoryMode::External && !machine_manager::notifier::vm_quiescent() {
+            bail!("External snapshot requires a confirmed device quiescence barrier");
+        }
         // Set status to `Active`
         MigrationManager::set_status(MigrationStatus::Active)?;
         MigrationManager::notify_status(true, MigrationStatus::Active)?;

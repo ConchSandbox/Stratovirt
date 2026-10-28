@@ -20,6 +20,22 @@ use once_cell::sync::Lazy;
 static NOTIFIER_MANAGER: Lazy<RwLock<NotifierManager>> =
     Lazy::new(|| RwLock::new(NotifierManager::new()));
 static VM_PAUSED: AtomicBool = AtomicBool::new(false);
+static VM_QUIESCENT: AtomicBool = AtomicBool::new(false);
+static CAPTURE_QUIESCENCE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Selected once from the supported microvm device configuration, before realization.
+pub fn set_capture_quiescence_enabled(enabled: bool) {
+    CAPTURE_QUIESCENCE_ENABLED.store(enabled, Ordering::SeqCst);
+    VM_QUIESCENT.store(false, Ordering::SeqCst);
+}
+
+pub fn capture_quiescence_enabled() -> bool {
+    CAPTURE_QUIESCENCE_ENABLED.load(Ordering::SeqCst)
+}
+
+pub fn capture_paused() -> bool {
+    capture_quiescence_enabled() && vm_paused()
+}
 
 pub type PauseNotifyCallback = dyn Fn(bool) + Send + Sync;
 
@@ -71,8 +87,21 @@ pub fn unregister_vm_pause_notifier(id: u64) {
 }
 
 pub fn pause_notify(paused: bool) {
+    if !paused {
+        VM_QUIESCENT.store(false, Ordering::SeqCst);
+    }
     VM_PAUSED.store(paused, Ordering::SeqCst);
     NOTIFIER_MANAGER.read().unwrap().pause_notify(paused);
+}
+
+/// A pause is capture-safe only after every RAM writer and block completion
+/// has drained. Device notification and vCPU state alone do not prove this.
+pub fn set_vm_quiescent(confirmed: bool) {
+    VM_QUIESCENT.store(confirmed, Ordering::SeqCst);
+}
+
+pub fn vm_quiescent() -> bool {
+    VM_QUIESCENT.load(Ordering::SeqCst)
 }
 
 pub fn vm_paused() -> bool {
