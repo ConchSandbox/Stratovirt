@@ -669,9 +669,7 @@ impl EventNotifierHelper for NetCtrlHandler {
 
             let gate = locked_net_io.io_gate.clone();
             let paused = gate.read().unwrap();
-            if *paused {
-                return None;
-            }
+            if *paused { return None; }
             let _inflight = locked_net_io.io_inflight.as_ref().map(|r| r.inc_ref());
             locked_net_io.handle_ctrl().unwrap_or_else(|e| {
                 error!("Failed to handle ctrl queue, error is {:?}.", e);
@@ -1248,9 +1246,7 @@ impl<T: Macnat + 'static> NetIoHandler<T> {
             }
 
             let paused = net_queue.io_gate.read().unwrap();
-            if *paused {
-                return None;
-            }
+            if *paused { return None; }
             let _inflight = net_queue.io_inflight.inc_ref();
             net_queue.listen_state.lock().unwrap().set_queue_avail(true);
             let mut locked_queue = net_queue.rx.queue.lock().unwrap();
@@ -1320,9 +1316,7 @@ impl<T: Macnat + 'static> NetIoHandler<T> {
             }
 
             let paused = net_queue.io_gate.read().unwrap();
-            if *paused {
-                return None;
-            }
+            if *paused { return None; }
             let _inflight = net_queue.io_inflight.inc_ref();
             if let Err(ref e) = net_queue.handle_tx(&tap) {
                 error!("Failed to handle tx(tx event) for net, {:?}", e);
@@ -1374,9 +1368,7 @@ impl<T: Macnat + 'static> NetIoHandler<T> {
             }
 
             let paused = net_queue.io_gate.read().unwrap();
-            if *paused {
-                return None;
-            }
+            if *paused { return None; }
             let _inflight = net_queue.io_inflight.inc_ref();
             if events.contains(EventSet::OUT) {
                 net_queue.listen_state.lock().unwrap().set_tap_full(false);
@@ -1507,10 +1499,9 @@ impl Net {
     fn control_info(&mut self) -> Arc<Mutex<CtrlInfo>> {
         // Keep the restored receive filters, and reconnect the runtime-only
         // configuration reference excluded from the serialized control state.
-        let info = self
-            .ctrl_info
-            .clone()
-            .unwrap_or_else(|| Arc::new(Mutex::new(CtrlInfo::new(self.config_space.clone()))));
+        let info = self.ctrl_info.clone().unwrap_or_else(|| {
+            Arc::new(Mutex::new(CtrlInfo::new(self.config_space.clone())))
+        });
         info.lock().unwrap().config = self.config_space.clone();
         self.ctrl_info = Some(info.clone());
         info
@@ -2291,8 +2282,7 @@ impl StateTransfer for Net {
             .with_context(|| migration::error::MigrationError::FromBytesError("NET"))?;
 
         if state.config_space.mac != self.config_space.lock().unwrap().mac
-            || state.device_features != self.base.device_features
-        {
+            || state.device_features != self.base.device_features {
             bail!("Snapshot network identity or features differ from device");
         }
         self.base.device_features = state.device_features;
@@ -2327,9 +2317,7 @@ impl MigrationHook for Net {
             if let Some(events) = &self.queue_evts {
                 // A notification consumed while paused must not strand a queue.
                 // RX also drains pending edge-triggered TAP packets.
-                for evt in events {
-                    evt.write(1).context("Resume net queue")?;
-                }
+                for evt in events { evt.write(1).context("Resume net queue")?; }
             }
         }
         Ok(())

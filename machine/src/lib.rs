@@ -3434,8 +3434,9 @@ pub trait MachineOps: MachineLifecycle {
             pause_notify(true);
             let mut failure = err;
             if let Err(rollback) = MigrationManager::quiesce_devices(true) {
-                failure =
-                    failure.context(format!("Failed to restore device quiescence: {rollback:#}"));
+                failure = failure.context(format!(
+                    "Failed to restore device quiescence: {rollback:#}"
+                ));
             }
             if full_resume {
                 if let Err(rollback) = self.deactive_drive_files() {
@@ -3847,10 +3848,7 @@ mod tests {
                 .env(CHILD, "1")
                 .status()
                 .unwrap();
-            assert!(
-                status.success(),
-                "isolated resume rollback regression failed"
-            );
+            assert!(status.success(), "isolated resume rollback regression failed");
             return;
         }
         use migration::{DeviceStateDesc, MigrationHook, StateTransfer};
@@ -3941,10 +3939,7 @@ mod tests {
                 );
                 assert!(!vm_quiescent(), "failed resume must not certify a barrier");
                 let message = format!("{error:#}");
-                assert!(
-                    message.contains("injected device resume error"),
-                    "{message}"
-                );
+                assert!(message.contains("injected device resume error"), "{message}");
                 if rollback_fails {
                     assert!(
                         message.contains("injected device rollback error"),
