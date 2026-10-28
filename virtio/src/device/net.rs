@@ -52,6 +52,7 @@ use address_space::{AddressAttr, AddressSpace};
 use machine_manager::config::{ConfigCheck, NetDevcfg, NetworkInterfaceConfig};
 use machine_manager::event_loop::{register_event_helper, unregister_event_helper, EventLoop};
 use machine_manager::mmds::tcp_stack::MmdsTcpStack;
+use machine_manager::notifier::capture_paused;
 use machine_manager::state_query::{
     register_state_query_callback, unregister_state_query_callback,
 };
@@ -533,6 +534,7 @@ pub struct NetCtrlHandler {
     pub device_broken: Arc<AtomicBool>,
     /// Indicate if IO is inflight.
     pub io_inflight: Option<IoRef>,
+    pub io_gate: Arc<RwLock<bool>>,
     /// Tap devices.
     pub taps: Option<Vec<Tap>>,
 }
@@ -665,6 +667,9 @@ impl EventNotifierHelper for NetCtrlHandler {
                 return None;
             }
 
+            let gate = locked_net_io.io_gate.clone();
+            let paused = gate.read().unwrap();
+            if *paused { return None; }
             let _inflight = locked_net_io.io_inflight.as_ref().map(|r| r.inc_ref());
             locked_net_io.handle_ctrl().unwrap_or_else(|e| {
                 error!("Failed to handle ctrl queue, error is {:?}.", e);
@@ -714,6 +719,7 @@ struct NetIoQueue<T> {
     queue_size: u16,
     macnat: Option<T>,
     io_inflight: IoRef,
+    io_gate: Arc<RwLock<bool>>,
     /// Shared MMDS TCP stack (Arc shared with Net so mmds_config can update it live).
     mmds_tcp_stack: Arc<Mutex<Option<MmdsTcpStack>>>,
 }
@@ -1239,6 +1245,8 @@ impl<T: Macnat + 'static> NetIoHandler<T> {
                 return None;
             }
 
+            let paused = net_queue.io_gate.read().unwrap();
+            if *paused { return None; }
             let _inflight = net_queue.io_inflight.inc_ref();
             net_queue.listen_state.lock().unwrap().set_queue_avail(true);
             let mut locked_queue = net_queue.rx.queue.lock().unwrap();
@@ -1307,6 +1315,8 @@ impl<T: Macnat + 'static> NetIoHandler<T> {
                 return None;
             }
 
+            let paused = net_queue.io_gate.read().unwrap();
+            if *paused { return None; }
             let _inflight = net_queue.io_inflight.inc_ref();
             if let Err(ref e) = net_queue.handle_tx(&tap) {
                 error!("Failed to handle tx(tx event) for net, {:?}", e);
@@ -1357,6 +1367,8 @@ impl<T: Macnat + 'static> NetIoHandler<T> {
                 return None;
             }
 
+            let paused = net_queue.io_gate.read().unwrap();
+            if *paused { return None; }
             let _inflight = net_queue.io_inflight.inc_ref();
             if events.contains(EventSet::OUT) {
                 net_queue.listen_state.lock().unwrap().set_tap_full(false);
@@ -1458,6 +1470,7 @@ pub struct Net {
     timer_id: Option<u64>,
     /// indicate if io is inflight
     io_inflight: IoRef,
+    io_gate: Arc<RwLock<bool>>,
     /// Shared MMDS TCP stack between Net and running NetIoQueue workers.
     /// Using Arc<Mutex<Option<...>>> so mmds_config can enable/disable it on
     /// already-activated devices without restarting the queue worker.
@@ -1478,8 +1491,20 @@ impl Net {
             net_cfg,
             netdev_cfg,
             link_status: Arc::new(AtomicBool::new(true)),
+            io_gate: Arc::new(RwLock::new(capture_paused())),
             ..Default::default()
         }
+    }
+
+    fn control_info(&mut self) -> Arc<Mutex<CtrlInfo>> {
+        // Keep the restored receive filters, and reconnect the runtime-only
+        // configuration reference excluded from the serialized control state.
+        let info = self.ctrl_info.clone().unwrap_or_else(|| {
+            Arc::new(Mutex::new(CtrlInfo::new(self.config_space.clone())))
+        });
+        info.lock().unwrap().config = self.config_space.clone();
+        self.ctrl_info = Some(info.clone());
+        info
     }
 
     fn register_update_notifier<T: Macnat + 'static>(
@@ -2096,8 +2121,7 @@ impl VirtioDevice for Net {
     ) -> Result<()> {
         let queues = self.base.queues.clone();
         let queue_num = queues.len();
-        let ctrl_info = Arc::new(Mutex::new(CtrlInfo::new(self.config_space.clone())));
-        self.ctrl_info = Some(ctrl_info.clone());
+        let ctrl_info = self.control_info();
         let driver_features = self.base.driver_features;
         if (driver_features & (1 << VIRTIO_NET_F_CTRL_VQ) != 0) && (!queue_num.is_multiple_of(2)) {
             let ctrl_queue = queues[queue_num - 1].clone();
@@ -2110,6 +2134,7 @@ impl VirtioDevice for Net {
                 driver_features,
                 device_broken: self.base.broken.clone(),
                 io_inflight: Some(self.io_inflight.clone()),
+                io_gate: self.io_gate.clone(),
                 taps: self.taps.clone(),
             };
 
@@ -2166,6 +2191,7 @@ impl VirtioDevice for Net {
                 queue_size: self.queue_size_max(),
                 macnat: self.get_macnat_handler(),
                 io_inflight: self.io_inflight.clone(),
+                io_gate: self.io_gate.clone(),
                 mmds_tcp_stack: self.mmds_tcp_stack.clone(),
             });
 
@@ -2255,6 +2281,10 @@ impl StateTransfer for Net {
         let state: VirtioNetState = serde_json::from_slice(state)
             .with_context(|| migration::error::MigrationError::FromBytesError("NET"))?;
 
+        if state.config_space.mac != self.config_space.lock().unwrap().mac
+            || state.device_features != self.base.device_features {
+            bail!("Snapshot network identity or features differ from device");
+        }
         self.base.device_features = state.device_features;
         self.base.driver_features = state.driver_features;
         self.base.broken.store(state.broken, Ordering::SeqCst);
@@ -2278,15 +2308,80 @@ impl StateTransfer for Net {
     }
 }
 
-impl MigrationHook for Net {}
+impl MigrationHook for Net {
+    fn quiesce(&self, paused: bool) -> Result<()> {
+        // The writer waits for every RX/TX/control callback to leave its read
+        // section. New callbacks cannot mutate RAM once the gate is closed.
+        *self.io_gate.write().unwrap() = paused;
+        if !paused {
+            if let Some(events) = &self.queue_evts {
+                // A notification consumed while paused must not strand a queue.
+                // RX also drains pending edge-triggered TAP packets.
+                for evt in events { evt.write(1).context("Resume net queue")?; }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests::eventloop_init;
 
+    static MAC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn isolated_mac_table() -> std::sync::MutexGuard<'static, ()> {
+        let guard = MAC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        MAC_TEST_LOCK.clear_poison();
+        *USED_MAC_TABLE.lock().unwrap_or_else(|e| e.into_inner()) = [0; MAX_MAC_ADDR_NUM];
+        USED_MAC_TABLE.clear_poison();
+        guard
+    }
+
+    #[test]
+    fn test_conch_network_quiesce_drains_and_rearms() {
+        let mut net = Net::default();
+        let evt = Arc::new(create_new_eventfd().unwrap());
+        net.queue_evts = Some(vec![evt.clone()]);
+        let gate = net.io_gate.clone();
+        let active = gate.read().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            net.quiesce(true).unwrap();
+            done_tx.send(()).unwrap();
+            net
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(active);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let net = worker.join().unwrap();
+        assert!(*gate.read().unwrap());
+        net.quiesce(false).unwrap();
+        assert!(!*gate.read().unwrap());
+        assert_eq!(evt.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_conch_network_restore_keeps_control_filters() {
+        let _mac_guard = isolated_mac_table();
+        let mut source = Net::default();
+        let info = source.control_info();
+        info.lock().unwrap().rx_mode.no_bcast = true;
+        info.lock().unwrap().vlan_map.insert(42, 1);
+        let state = source.get_state_vec().unwrap();
+        let mut restored = Net::default();
+        restored.set_state_mut(&state, 0).unwrap();
+        let info = restored.control_info();
+        let info = info.lock().unwrap();
+        assert!(info.rx_mode.no_bcast);
+        assert_eq!(info.vlan_map.get(&42), Some(&1));
+        assert!(Arc::ptr_eq(&info.config, &restored.config_space));
+    }
+
     #[test]
     fn test_net_init() {
+        let _mac_guard = isolated_mac_table();
         // test net new method
         let mut net = Net::new(NetworkInterfaceConfig::default(), NetDevcfg::default());
         assert_eq!(net.base.device_features, 0);
@@ -2414,6 +2509,7 @@ mod tests {
 
     #[test]
     fn test_mac_table() {
+        let _mac_guard = isolated_mac_table();
         let mut mac = FIRST_DEFAULT_MAC;
         // Add mac to mac table.
         mark_mac_table(&mac, true);
@@ -2449,6 +2545,7 @@ mod tests {
 
     #[test]
     fn test_iothread() {
+        let _mac_guard = isolated_mac_table();
         eventloop_init();
 
         let mut net = Net::new(NetworkInterfaceConfig::default(), NetDevcfg::default());
@@ -2466,15 +2563,22 @@ mod tests {
 
     #[test]
     fn test_state_transfer() {
+        let _mac_guard = isolated_mac_table();
         let mut net = Net::new(NetworkInterfaceConfig::default(), NetDevcfg::default());
         net.realize().unwrap();
 
         let device_features = net.base.device_features;
+        net.base.driver_features = device_features;
         let driver_features = net.base.driver_features;
         let broken = net.base.broken.load(Ordering::SeqCst);
 
         let init_state = net.get_state_vec().unwrap();
         net.base.device_features = 0;
+        assert!(net.set_state_mut(&init_state, 0u32).is_err());
+        net.base.device_features = device_features;
+        net.config_space.lock().unwrap().mac[0] ^= 2;
+        assert!(net.set_state_mut(&init_state, 0u32).is_err());
+        net.config_space.lock().unwrap().mac[0] ^= 2;
         net.base.driver_features = 0;
         net.base.broken.store(true, Ordering::SeqCst);
 

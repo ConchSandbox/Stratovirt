@@ -158,10 +158,13 @@ impl VmConfig {
     pub fn supports_capture_quiescence(&self) -> bool {
         self.machine_config.mach_type == MachineType::MicroVm
             && self.virtio_serial.is_none()
-            && self.netdevs.is_empty()
+            && self.netdevs.values().all(|net| {
+                net.netdev_type == "tap" && !net.vhost_kernel && net.vhost_fds.is_none()
+                    && !net.macnat && net.queues == 2 && net.tap_fds.as_ref().map(Vec::len) == Some(1)
+            })
             && self.devices.iter().all(|(kind, _)| matches!(
                 kind.as_str(),
-                "virtio-blk-device" | "virtio-pmem-device" | "vhost-vsock-device"
+                "virtio-blk-device" | "virtio-pmem-device" | "vhost-vsock-device" | "virtio-net-device"
             ))
     }
 
@@ -905,6 +908,15 @@ mod tests {
             unsupported.devices.push((kind.into(), kind.into()));
             assert!(!unsupported.supports_capture_quiescence(), "{kind}");
         }
+        config.devices.push(("virtio-net-device".into(), "virtio-net-device,id=n".into()));
+        config.netdevs.insert("n".into(), NetDevcfg {
+            netdev_type: "tap".into(), tap_fds: Some(vec![3]), queues: 2,
+            ..Default::default()
+        });
+        assert!(config.supports_capture_quiescence());
+        config.netdevs.get_mut("n").unwrap().vhost_kernel = true;
+        assert!(!config.supports_capture_quiescence());
+        config.netdevs.clear();
         config.machine_config.mach_type = MachineType::StandardVm;
         assert!(!config.supports_capture_quiescence());
     }

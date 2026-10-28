@@ -229,6 +229,7 @@ impl VirtioDevice for Net {
                 driver_features,
                 device_broken: self.base.broken.clone(),
                 io_inflight: None,
+                io_gate: Default::default(),
                 taps: None,
             };
 
